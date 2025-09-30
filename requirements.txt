@@ -4,3 +4,4 @@ feedparser==6.0.12
 pandas==2.3.3
 numpy==2.3.3
 plotly==6.3.0
+vnstock
