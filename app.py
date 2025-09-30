@@ -2,30 +2,21 @@
 """
 VN Stock News–Price Analyzer (Vietnam-native prices via vnstock)
 
-Enter a Vietnam stock ticker (e.g., HPG, MSN, VNM, MBS) to:
-  • Fetch price history from Vietnam sources (library: vnstock)
-  • Pull recent Vietnamese news via Google News RSS
-  • Score sentiment (lightweight lexicon; optional multilingual transformer)
-  • Correlate daily sentiment vs. forward returns
-  • Visualize and export CSVs
-
-Install:
-  pip install streamlit vnstock feedparser pandas numpy plotly
-# Optional for stronger sentiment (larger build):
-# pip install transformers torch --extra-index-url https://download.pytorch.org/whl/cpu
-
-Run:
-  streamlit run app.py
+- Prices: vnstock (daily OHLCV in VND)
+- News: Google News RSS (Vietnamese)
+- Sentiment: simple lexicon (optional multilingual transformer)
 """
 
+import sys
+import platform
 import datetime as dt
 import math
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -42,6 +33,15 @@ except Exception:
 # -------------------------- UI & Config -------------------------- #
 
 st.set_page_config(page_title="VN Stock News–Price Analyzer", layout="wide")
+
+# Diagnostics (helps quickly see env if something fails)
+with st.expander("Diagnostics (env versions)"):
+    st.write({
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+    })
 
 @dataclass
 class NewsItem:
@@ -62,40 +62,26 @@ def _coerce_dt(x: str) -> dt.datetime:
 
 def _clean_price_df_from_vnstock(df: pd.DataFrame) -> pd.DataFrame:
     """
-    vnstock.stock_historical_data returns columns like:
-      time, open, high, low, close, volume (and maybe 'ticker')
-    Normalize to: date, Open, High, Low, Close, Volume (float), ascending by date.
+    Normalize vnstock output to: date, Open, High, Low, Close, Volume (numeric), ascending by date.
     """
     df = df.copy()
-    # standardize column names (lowercase first)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-    # figure out the date/time column name
     time_col = "time" if "time" in df.columns else ("date" if "date" in df.columns else None)
     if time_col is None:
         raise ValueError("vnstock returned data without a 'time' or 'date' column.")
     df.rename(columns={time_col: "date"}, inplace=True)
 
-    # rename OHLCV to Title case expected by Plotly
-    rename_map = {
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "adj_close": "Adj Close",
-        "volume": "Volume",
-    }
+    rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close",
+                  "adj_close": "Adj Close", "volume": "Volume"}
     for k, v in rename_map.items():
         if k in df.columns:
             df.rename(columns={k: v}, inplace=True)
 
-    # ensure datetime & numeric types
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # drop bad rows and sort
     keep_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
     if keep_cols:
         df = df.dropna(subset=keep_cols)
@@ -107,30 +93,30 @@ def _clean_price_df_from_vnstock(df: pd.DataFrame) -> pd.DataFrame:
 def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
     """
     Fetch daily OHLCV for a VN ticker using the vnstock library.
-    Returns (resolved_symbol, prices_df, debug_log_df)
+    Returns (resolved_symbol, prices_df, debug_log_df).
     """
     attempts: List[Dict[str, Any]] = []
 
     try:
-        # import inside to keep startup fast if user hasn't installed vnstock yet
         from vnstock import stock_historical_data  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "The 'vnstock' package is not installed. Please add 'vnstock' to requirements.txt."
-        ) from e
+            "Failed to import 'vnstock'. This usually means the package wasn't installed "
+            f"for the running Python ({sys.version.split()[0]}) or there's a dependency conflict.\n"
+            "Check that requirements.txt includes 'vnstock' and that numpy/pandas versions are compatible.\n"
+            f"Underlying import error: {type(e).__name__}: {e}"
+        )
 
-    # vnstock uses 'YYYY-MM-DD' strings
+    symbol = ticker.strip().upper()
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
 
-    symbol = ticker.strip().upper()
-    # Single attempt (vnstock doesn't require exchange suffix)
     try:
         df = stock_historical_data(
             symbol=symbol,
             start_date=start_str,
             end_date=end_str,
-            resolution="1D",  # daily bars
+            resolution="1D",
         )
         n = int(len(df)) if isinstance(df, pd.DataFrame) else 0
         attempts.append({"symbol": symbol, "method": "vnstock.stock_historical_data(1D)", "rows": n})
@@ -144,7 +130,7 @@ def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date) -> Tuple[str,
     debug_df = pd.DataFrame(attempts)
     raise RuntimeError(
         f"No VN data returned for {symbol}. "
-        "Please check the ticker code (e.g., HPG, VNM, FPT, MBS) and date range."
+        "Please check ticker and date range (try a longer window)."
     )
 
 # -------------------------- News & Sentiment -------------------------- #
@@ -173,7 +159,6 @@ def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
             dedup[key] = it
     return sorted(dedup.values(), key=lambda x: x.published)
 
-# Simple Vietnamese lexicon (fallback if no transformer)
 VI_POS = set("tăng|kỷ lục|tích cực|lợi nhuận|vượt|bứt phá|khả quan|mua ròng|đỉnh|bùng nổ|thuận lợi".split("|"))
 VI_NEG = set("giảm|tiêu cực|thua lỗ|lỗ|suy giảm|sụt|bán ròng|khó khăn|điều tra|phạt|rủi ro|đình chỉ|suy thoái|nợ xấu".split("|"))
 
@@ -219,7 +204,7 @@ def attach_sentiment(items: List[NewsItem]) -> List[NewsItem]:
 # ------------------------------ UI ------------------------------ #
 
 st.title("🇻🇳 VN Stock News–Price Analyzer")
-st.caption("Dữ liệu giá lấy từ nguồn Việt Nam (thư viện `vnstock`). Tin tức từ Google News (tiếng Việt).")
+st.caption("Dữ liệu giá từ nguồn Việt Nam (thư viện `vnstock`). Tin tức từ Google News (tiếng Việt).")
 
 col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
@@ -244,7 +229,7 @@ if run:
         else:
             start, end = dt.date.today() - dt.timedelta(days=365), dt.date.today()
 
-        # --- Prices from vnstock ---
+        # Prices (vnstock)
         resolved, prices, debug_log = load_prices_vietnam(raw_ticker, start, end)
         st.success(f"Đã tìm thấy dữ liệu giá: {resolved} ({len(prices)} phiên)")
         with st.expander("Debug: thông tin tải giá"):
@@ -269,7 +254,7 @@ if run:
         pxdf["ret1"] = pxdf["Close"].pct_change()
         pxdf["ret5"] = pxdf["Close"].pct_change(5)
 
-        # --- News + sentiment ---
+        # News + sentiment
         query = f"{raw_ticker} {company_hint}".strip()
         news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
         if not news:
@@ -343,13 +328,12 @@ if run:
 
         with st.expander("Nguồn & mẹo truy vấn"):
             st.markdown(
-                "- Giá: Nguồn Việt Nam qua thư viện `vnstock` (VND, theo sàn Việt).\n"
-                "- Tin tức: Google News RSS — thêm tên DN/từ khóa ‘kqkd’, ‘cổ tức’, ‘trái phiếu’ để chính xác hơn.\n"
-                "- Gợi ý: Dùng mã 3 ký tự chuẩn của sàn VN, ví dụ HPG, VNM, FPT, MBS..."
+                "- Giá: Nguồn Việt Nam qua thư viện `vnstock` (VND).\n"
+                "- Tin tức: Google News RSS — thêm tên DN/từ khóa ‘kqkd’, ‘cổ tức’, ‘trái phiếu’ để chính xác hơn."
             )
 
     except Exception as e:
         st.error(f"Lỗi: {e}")
 
 else:
-    st.info("Nhập mã cổ phiếu và bấm **Phân tích ngay** để bắt đầu. Ví dụ: HPG (Hòa Phát), VNM (Vinamilk), MSN (Masan), MBS (MB Securities).")
+    st.info("Nhập mã cổ phiếu và bấm **Phân tích ngay** để bắt đầu. Ví dụ: HPG, VNM, MSN, FPT, MBS.")
