@@ -103,6 +103,30 @@ def load_prices(raw_ticker: str, start: dt.date, end: dt.date) -> Tuple[str, pd.
         raise RuntimeError("yfinance is not installed. Please `pip install yfinance`.")
     for candidate in guess_yf_ticker(raw_ticker):
         try:
+            df = yf.download(
+                candidate,
+                start=start.isoformat(),
+                end=(end + dt.timedelta(days=1)).isoformat(),
+                progress=False,
+            )
+            if isinstance(df, pd.DataFrame) and len(df) > 5:
+                df = df.rename(columns=str.title)
+                df = df.reset_index().rename(columns={"Date": "date"})
+                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                # Ensure numeric dtypes so Plotly doesn't treat as categorical
+                for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
+                if "Close" in df.columns:
+                    df = df[df["Close"] > 0]
+                if len(df) > 5:
+                    return candidate, df
+        except Exception:
+            pass
+    raise RuntimeError("Could not fetch price data. Try another ticker or date range.")
+    for candidate in guess_yf_ticker(raw_ticker):
+        try:
             df = yf.download(candidate, start=start.isoformat(), end=(end + dt.timedelta(days=1)).isoformat(), progress=False)
             if isinstance(df, pd.DataFrame) and len(df) > 5:
                 df = df.rename(columns=str.title)
