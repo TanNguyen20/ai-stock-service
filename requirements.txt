@@ -1,7 +1,9 @@
-streamlit==1.50.0
-yfinance==0.2.66
-feedparser==6.0.12
-pandas==2.3.3
-numpy==2.3.3
-plotly==6.3.0
+streamlit
 vnstock
+feedparser
+pandas
+numpy
+plotly
+# optional (uncomment if you want multilingual transformer sentiment):
+# transformers
+# torch
