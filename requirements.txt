@@ -1,0 +1,11 @@
+streamlit
+yfinance
+feedparser
+pandas
+numpy
+plotly
+scikit-learn
+underthesea==6.8.4
+# optional, only if you want transformer sentiment (slower to build)
+# transformers
+# torch
