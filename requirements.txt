@@ -1,11 +1,10 @@
-streamlit
-yfinance
-feedparser
-pandas
-numpy
-plotly
-scikit-learn
-underthesea==6.8.4
-# optional, only if you want transformer sentiment (slower to build)
+streamlit==1.50.0
+yfinance==0.2.66
+feedparser==6.0.12
+pandas==2.3.3
+numpy==2.3.3
+plotly==6.3.0
+scikit-learn==1.7.2
+# optional — only add later if you really want transformer sentiment (slower build):
 # transformers
 # torch
