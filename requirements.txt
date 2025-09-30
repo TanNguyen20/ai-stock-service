@@ -1,9 +1,7 @@
-streamlit
+# Pinned to versions that work well together on Streamlit Cloud + Python 3.10
+streamlit==1.32.0
+pandas==2.2.2
+numpy==1.26.4
 vnstock
-feedparser
-pandas
-numpy
-plotly
-# optional (uncomment if you want multilingual transformer sentiment):
-# transformers
-# torch
+feedparser==6.0.12
+plotly==6.3.0
