@@ -108,7 +108,18 @@ def load_prices(raw_ticker: str, start: dt.date, end: dt.date) -> Tuple[str, pd.
                 df = df.rename(columns=str.title)
                 df = df.reset_index().rename(columns={"Date": "date"})
                 df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-                return candidate, df
+                # --- Ensure numeric dtypes (avoid Plotly categorical axis 0..4 bug) ---
+                for col in ["Open","High","Low","Close","Adj Close","Volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                # drop rows with bad/zero prices
+                df = df.dropna(subset=[c for c in ["Open","High","Low","Close"] if c in df.columns])
+                df = df[df["Close"] > 0]
+                if len(df) > 5:
+                    return candidate, df
+        except Exception:
+            pass
+    raise RuntimeError("Could not fetch price data. Try another ticker or date range.")
         except Exception:
             pass
     raise RuntimeError("Could not fetch price data. Try another ticker or date range.")
@@ -248,7 +259,51 @@ if run:
             st.subheader("Tin tức & cảm xúc thị trường")
             st.dataframe(nd[["published","title","source","sentiment","link"]].sort_values("published", ascending=False), use_container_width=True, hide_index=True)
 
-            # Daily agg sentiment\n            daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment":"sent_daily"})\n            # avoid name clash with pxdf['date'] by renaming the news key\n            daily_sent = daily_sent.rename(columns={"date":"news_date"})\n\n            pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date\n            merged = pxdf.merge(\n                daily_sent,\n                left_on="date_only",\n                right_on="news_date",\n                how="left"\n            )\n            merged["sent_daily"] = merged["sent_daily"].fillna(0.0)\n\n            # Rolling avg and lag relationship\n            merged["sent_roll3"] = merged["sent_daily"].rolling(3, min_periods=1).mean()\n            merged["fwd_ret1"] = merged["ret1"].shift(-1)\n            merged["fwd_ret5"] = merged["ret5"].shift(-5)\n\n            # Correlations\n            corr1 = merged[["sent_daily","fwd_ret1"]].corr().iloc[0,1]\n            corr5 = merged[["sent_roll3","fwd_ret5"]].corr().iloc[0,1]\n\n            c1 = 0.0 if math.isnan(corr1) else float(corr1)\n            c5 = 0.0 if math.isnan(corr5) else float(corr5)\n            st.markdown(f"**Tương quan**: cùng ngày vs. lợi suất ngày kế tiếp = **{c1:.3f}** · trung bình 3 ngày vs. lợi suất 5 ngày tới = **{c5:.3f}**")\n\n            # Plot: sentiment vs. price (use separate axes to avoid internal merges)\n            from plotly.subplots import make_subplots\n            fig1 = make_subplots(specs=[[{"secondary_y": True}]])\n            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)\n            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)\n            fig1.update_yaxes(title_text="Close", secondary_y=False)\n            fig1.update_yaxes(title_text="Sentiment (MA3)", secondary_y=True)\n            st.plotly_chart(fig1, use_container_width=True)\n\n            # Scatter with optional trendline (only if statsmodels is present)\n            try:\n                import statsmodels.api as sm  # noqa: F401\n                scat = px.scatter(merged, x="sent_roll3", y="fwd_ret5", trendline="ols", labels={"sent_roll3":"Sentiment (MA3)", "fwd_ret5":"Lợi suất 5 ngày tới"})\n            except Exception:\n                scat = px.scatter(merged, x="sent_roll3", y="fwd_ret5", labels={"sent_roll3":"Sentiment (MA3)", "fwd_ret5":"Lợi suất 5 ngày tới"})\n            st.plotly_chart(scat, use_container_width=True)\n\n            # Export buttons
+            # Daily agg sentiment
+            daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment":"sent_daily"})
+            # avoid name clash with pxdf['date'] by renaming the news key
+            daily_sent = daily_sent.rename(columns={"date":"news_date"})
+
+            pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date
+            merged = pxdf.merge(
+                daily_sent,
+                left_on="date_only",
+                right_on="news_date",
+                how="left"
+            )
+            merged["sent_daily"] = merged["sent_daily"].fillna(0.0)
+
+            # Rolling avg and lag relationship
+            merged["sent_roll3"] = merged["sent_daily"].rolling(3, min_periods=1).mean()
+            merged["fwd_ret1"] = merged["ret1"].shift(-1)
+            merged["fwd_ret5"] = merged["ret5"].shift(-5)
+
+            # Correlations
+            corr1 = merged[["sent_daily","fwd_ret1"]].corr().iloc[0,1]
+            corr5 = merged[["sent_roll3","fwd_ret5"]].corr().iloc[0,1]
+
+            c1 = 0.0 if math.isnan(corr1) else float(corr1)
+            c5 = 0.0 if math.isnan(corr5) else float(corr5)
+            st.markdown(f"**Tương quan**: cùng ngày vs. lợi suất ngày kế tiếp = **{c1:.3f}** · trung bình 3 ngày vs. lợi suất 5 ngày tới = **{c5:.3f}**")
+
+            # Plot: sentiment vs. price (use separate axes to avoid internal merges)
+            from plotly.subplots import make_subplots
+            fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)
+            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)
+            fig1.update_yaxes(title_text="Close", secondary_y=False)
+            fig1.update_yaxes(title_text="Sentiment (MA3)", secondary_y=True)
+            st.plotly_chart(fig1, use_container_width=True)
+
+            # Scatter with optional trendline (only if statsmodels is present)
+            try:
+                import statsmodels.api as sm  # noqa: F401
+                scat = px.scatter(merged, x="sent_roll3", y="fwd_ret5", trendline="ols", labels={"sent_roll3":"Sentiment (MA3)", "fwd_ret5":"Lợi suất 5 ngày tới"})
+            except Exception:
+                scat = px.scatter(merged, x="sent_roll3", y="fwd_ret5", labels={"sent_roll3":"Sentiment (MA3)", "fwd_ret5":"Lợi suất 5 ngày tới"})
+            st.plotly_chart(scat, use_container_width=True)
+
+            # Export buttons
             csv_prices = pxdf.to_csv(index=False).encode("utf-8")
             csv_news = nd.to_csv(index=False).encode("utf-8")
             st.download_button("Tải CSV giá", csv_prices, file_name=f"{raw_ticker}_prices.csv", mime="text/csv")
