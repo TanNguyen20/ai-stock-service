@@ -9,19 +9,21 @@ Enter a Vietnam stock ticker (e.g., HPG, MSN, VNM) to:
   • Correlate daily sentiment vs. forward returns
   • Visualize and export CSVs
 
-Quick run (locally):
+Minimal deps:
   pip install streamlit yfinance feedparser pandas numpy plotly
-  # optional for stronger sentiment:
+
+Optional (multilingual transformer sentiment):
   # pip install transformers torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-streamlit run app.py
+Run:
+  streamlit run app.py
 """
 
 import datetime as dt
 import math
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -47,13 +49,9 @@ except Exception:
 
 # -------------------------- Config & Helpers -------------------------- #
 
-st.set_page_config(
-    page_title="VN Stock News–Price Analyzer",
-    layout="wide",
-)
+st.set_page_config(page_title="VN Stock News–Price Analyzer", layout="wide")
 
 COMMON_SUFFIXES = [".VN", ".HM", ".HSX", ".HNX", ".UPCOM"]
-
 
 @dataclass
 class NewsItem:
@@ -64,64 +62,115 @@ class NewsItem:
     source: str
     sentiment: Optional[float] = None  # -1 .. 1
 
-
 def _coerce_dt(x: str) -> dt.datetime:
     try:
-        # feedparser returns a time tuple via _parse_date
         return dt.datetime(*feedparser._parse_date(x)[:6])  # type: ignore[attr-defined]
     except Exception:
         return dt.datetime.utcnow()
-
 
 def guess_yf_ticker(raw: str) -> List[str]:
     raw = raw.strip().upper()
     if raw.endswith(tuple(COMMON_SUFFIXES)):
         return [raw]
-    return [raw + s for s in COMMON_SUFFIXES] + [raw]
+    # Try most likely codes first (.VN then raw)
+    return [raw + ".VN", raw] + [raw + s for s in [".HM", ".HSX", ".HNX", ".UPCOM"]]
 
+def _clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns=str.title)
+    if "Date" in df.columns:
+        df = df.reset_index().rename(columns={"Date": "date"})
+    elif "Datetime" in df.columns:
+        df = df.reset_index().rename(columns={"Datetime": "date"})
+    elif "date" not in df.columns:
+        # Some yfinance versions already return a column named 'date'
+        df = df.rename_axis("date").reset_index()
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
 
-def load_prices(raw_ticker: str, start: dt.date, end: dt.date) -> Tuple[str, pd.DataFrame]:
-    """Try common Vietnam suffixes and return (resolved_symbol, dataframe)."""
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    keep_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+    if keep_cols:
+        df = df.dropna(subset=keep_cols)
+    if "Close" in df.columns:
+        df = df[df["Close"] > 0]
+    return df
+
+def load_prices(raw_ticker: str, start: dt.date, end: dt.date) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
+    """
+    Try multiple methods and suffixes to fetch data from Yahoo Finance.
+    Returns (resolved_symbol, dataframe, debug_log_df)
+    """
     if yf is None:
         raise RuntimeError("yfinance is not installed. Please `pip install yfinance`.")
+
+    attempts: List[Dict[str, Any]] = []
+    # Add a small buffer to end date for inclusive ranges
+    end_plus = end + dt.timedelta(days=1)
+
     for candidate in guess_yf_ticker(raw_ticker):
+        # Method 1: yf.download with start/end
         try:
-            df = yf.download(
-                candidate,
-                start=start.isoformat(),
-                end=(end + dt.timedelta(days=1)).isoformat(),
-                progress=False,
-            )
-            if isinstance(df, pd.DataFrame) and len(df) > 0:
-                df = df.rename(columns=str.title)
-                df = df.reset_index().rename(columns={"Date": "date"})
-                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+            df1 = yf.download(candidate, start=start.isoformat(), end=end_plus.isoformat(), progress=False)
+            n1 = int(len(df1)) if isinstance(df1, pd.DataFrame) else 0
+            attempts.append({"symbol": candidate, "method": "download(start/end)", "rows": n1})
+            if n1 > 0:
+                cleaned = _clean_price_df(df1)
+                if len(cleaned) > 0:
+                    return candidate, cleaned, pd.DataFrame(attempts)
+        except Exception as e:
+            attempts.append({"symbol": candidate, "method": "download(start/end) ERROR", "rows": 0, "msg": str(e)})
 
-                # Ensure numeric dtypes for Plotly candlestick (avoid categorical axis)
-                for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Method 2: Ticker.history with start/end
+        try:
+            tkr = yf.Ticker(candidate)
+            df2 = tkr.history(start=start.isoformat(), end=end_plus.isoformat(), interval="1d", auto_adjust=False)
+            n2 = int(len(df2)) if isinstance(df2, pd.DataFrame) else 0
+            attempts.append({"symbol": candidate, "method": "history(start/end)", "rows": n2})
+            if n2 > 0:
+                cleaned = _clean_price_df(df2)
+                if len(cleaned) > 0:
+                    return candidate, cleaned, pd.DataFrame(attempts)
+        except Exception as e:
+            attempts.append({"symbol": candidate, "method": "history(start/end) ERROR", "rows": 0, "msg": str(e)})
 
-                # Drop bad rows; require positive close for plotting
-                keep_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
-                if keep_cols:
-                    df = df.dropna(subset=keep_cols)
-                if "Close" in df.columns:
-                    df = df[df["Close"] > 0]
+        # Method 3: Ticker.history with period (fallback, ignores specific start/end)
+        try:
+            # choose period based on requested span (cap at 5y)
+            span_days = max(1, (end - start).days)
+            if span_days <= 365:
+                period = "1y"
+            elif span_days <= 365 * 2:
+                period = "2y"
+            elif span_days <= 365 * 5:
+                period = "5y"
+            else:
+                period = "10y"
+            tkr = yf.Ticker(candidate)
+            df3 = tkr.history(period=period, interval="1d", auto_adjust=False)
+            n3 = int(len(df3)) if isinstance(df3, pd.DataFrame) else 0
+            attempts.append({"symbol": candidate, "method": f"history(period={period})", "rows": n3})
+            if n3 > 0:
+                cleaned = _clean_price_df(df3)
+                # filter to requested window if possible
+                mask = (cleaned["date"].dt.date >= start) & (cleaned["date"].dt.date <= end)
+                cleaned = cleaned.loc[mask].reset_index(drop=True)
+                if len(cleaned) == 0:
+                    # If filtering removed all rows, still return the unfiltered data as a last resort
+                    cleaned = _clean_price_df(df3)
+                if len(cleaned) > 0:
+                    return candidate, cleaned, pd.DataFrame(attempts)
+        except Exception as e:
+            attempts.append({"symbol": candidate, "method": "history(period) ERROR", "rows": 0, "msg": str(e)})
 
-                if len(df) > 0:
-                    return candidate, df
-        except Exception:
-            # Try next candidate
-            pass
-    raise RuntimeError("Could not fetch price data. Try another ticker or date range.")
-
+    # If we got here, all attempts failed
+    debug_df = pd.DataFrame(attempts)
+    raise RuntimeError(f"No data returned for {raw_ticker}. Tried: {', '.join(debug_df['symbol'].unique())}")
 
 def google_news_rss(query: str, days: int = 30, lang: str = "vi") -> str:
-    """Build Google News RSS URL for a query in Vietnamese results."""
     q = re.sub(r"\s+", "+", query.strip())
     return f"https://news.google.com/rss/search?q={q}+when:{days}d&hl={lang}&gl=VN&ceid=VN:{lang}"
-
 
 def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
     url = google_news_rss(query, days=days)
@@ -134,23 +183,14 @@ def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
         src = e.get("source", {})
         source_title = src.get("title", src) if isinstance(src, dict) else src
         published = _coerce_dt(e.get("published", ""))
-        items.append(
-            NewsItem(
-                published=published,
-                title=title,
-                summary=summary,
-                link=link,
-                source=source_title or "",
-            )
-        )
-    # Deduplicate by title (case-insensitive)
+        items.append(NewsItem(published, title, summary, link, source_title or ""))
+    # Deduplicate by title
     dedup = {}
     for it in items:
         key = it.title.lower()
         if key not in dedup:
             dedup[key] = it
     return sorted(dedup.values(), key=lambda x: x.published)
-
 
 # ---- Sentiment ---- #
 VI_POS = set("tăng|kỷ lục|tích cực|lợi nhuận|vượt|bứt phá|khả quan|mua ròng|đỉnh|bùng nổ|thuận lợi".split("|"))
@@ -169,13 +209,10 @@ def _load_model():
     except Exception:
         return None, None
 
-
 def score_sentiment(text: str) -> float:
-    """Return polarity in [-1, 1]. Uses transformer if available, else lexicon."""
     text = (text or "").strip()
     if not text:
         return 0.0
-
     tok, mdl = _load_model()
     if tok is not None and mdl is not None:
         try:
@@ -183,25 +220,20 @@ def score_sentiment(text: str) -> float:
                 inputs = tok(text[:512], return_tensors="pt", truncation=True)
                 logits = mdl(**inputs).logits[0]
                 probs = torch.softmax(logits, dim=0).cpu().numpy()
-                # labels: [negative, neutral, positive]
-                return float(probs[2] - probs[0])
+                return float(probs[2] - probs[0])  # pos - neg
         except Exception:
             pass
-
-    # Fallback: simple Vietnamese lexicon count
     toks = re.findall(r"\w+", text.lower())
     pos = sum(1 for t in toks if t in VI_POS)
     neg = sum(1 for t in toks if t in VI_NEG)
     if pos == 0 and neg == 0:
         return 0.0
-    return (pos - neg) / max(1, (pos + neg))
-
+    return (pos - neg) / max(1, pos + neg)
 
 def attach_sentiment(items: List[NewsItem]) -> List[NewsItem]:
     for it in items:
         it.sentiment = score_sentiment(f"{it.title}. {it.summary}")
     return items
-
 
 # ------------------------------ UI ------------------------------ #
 st.title("🇻🇳 VN Stock News–Price Analyzer")
@@ -221,76 +253,58 @@ with col3:
     )
 
 company_hint = st.text_input("Tên công ty (tùy chọn, tăng độ chính xác tìm tin)", value="Hòa Phát")
-
 run = st.button("Phân tích ngay", type="primary")
 
 if run:
     try:
-        # Handle single-date vs range selection
         if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
             start, end = date_range
         else:
             start, end = dt.date.today() - dt.timedelta(days=365), dt.date.today()
 
-        # Prices
-        yf_symbol, prices = load_prices(raw_ticker, start, end)
-        st.success(f"Đã tìm thấy dữ liệu giá: {yf_symbol} ({len(prices)} phiên)")
+        # Prices (with debug log)
+        resolved, prices, debug_log = load_prices(raw_ticker, start, end)
+        st.success(f"Đã tìm thấy dữ liệu giá: {resolved} ({len(prices)} phiên)")
+
+        with st.expander("Debug: các phương án tải giá đã thử"):
+            st.dataframe(debug_log, use_container_width=True, hide_index=True)
 
         # Candlestick
         st.subheader("Giá lịch sử")
         fig_price = go.Figure()
-        fig_price.add_trace(
-            go.Candlestick(
-                x=prices["date"],
-                open=prices["Open"],
-                high=prices["High"],
-                low=prices["Low"],
-                close=prices["Close"],
-                name="Giá",
-            )
-        )
+        fig_price.add_trace(go.Candlestick(
+            x=prices["date"], open=prices["Open"], high=prices["High"], low=prices["Low"], close=prices["Close"], name="Giá"
+        ))
         fig_price.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig_price, use_container_width=True)
 
         # Returns
         pxdf = prices.copy()
+        if "Close" not in pxdf.columns:
+            st.warning("Thiếu cột Close trong dữ liệu giá.")
         pxdf["ret1"] = pxdf["Close"].pct_change()
         pxdf["ret5"] = pxdf["Close"].pct_change(5)
 
         # News + sentiment
         query = f"{raw_ticker} {company_hint}".strip()
         news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
-
         if not news:
             st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
         else:
-            nd = pd.DataFrame(
-                [
-                    {
-                        "date": pd.to_datetime(n.published).tz_localize(None).date(),
-                        "published": pd.to_datetime(n.published).tz_localize(None),
-                        "title": n.title,
-                        "summary": n.summary,
-                        "link": n.link,
-                        "source": n.source,
-                        "sentiment": n.sentiment,
-                    }
-                    for n in news
-                ]
-            )
+            nd = pd.DataFrame([{
+                "date": pd.to_datetime(n.published).tz_localize(None).date(),
+                "published": pd.to_datetime(n.published).tz_localize(None),
+                "title": n.title, "summary": n.summary, "link": n.link,
+                "source": n.source, "sentiment": n.sentiment
+            } for n in news])
 
             st.subheader("Tin tức & cảm xúc thị trường")
-            st.dataframe(
-                nd[["published", "title", "source", "sentiment", "link"]].sort_values("published", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(nd[["published", "title", "source", "sentiment", "link"]].sort_values("published", ascending=False),
+                        use_container_width=True, hide_index=True)
 
-            # Daily agg sentiment (rename to avoid merge name clash)
+            # Daily sentiment → merge
             daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment": "sent_daily"})
             daily_sent = daily_sent.rename(columns={"date": "news_date"})
-
-            # Merge with prices on date-only
             pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date
             merged = pxdf.merge(daily_sent, left_on="date_only", right_on="news_date", how="left")
             merged["sent_daily"] = merged["sent_daily"].fillna(0.0)
@@ -307,7 +321,6 @@ if run:
                     return 0.0 if math.isnan(val) else float(val)
                 except Exception:
                     return 0.0
-
             c1 = _safe_corr("sent_daily", "fwd_ret1")
             c5 = _safe_corr("sent_roll3", "fwd_ret5")
             st.markdown(
@@ -315,15 +328,11 @@ if run:
                 f"MA3 sentiment → lợi suất 5 ngày tới = **{c5:.3f}**"
             )
 
-            # Plot: Close (primary Y) + sentiment MA3 (secondary Y)
-            from plotly.subplots import make_subplots  # local import
-
+            # Plot: Close + sentiment
+            from plotly.subplots import make_subplots
             fig1 = make_subplots(specs=[[{"secondary_y": True}]])
             fig1.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)
-            fig1.add_trace(
-                go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"),
-                secondary_y=True,
-            )
+            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)
             fig1.update_yaxes(title_text="Close", secondary_y=False)
             fig1.update_yaxes(title_text="Sentiment (MA3)", secondary_y=True)
             fig1.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
@@ -339,10 +348,11 @@ if run:
             )
             st.plotly_chart(scat, use_container_width=True)
 
-            # Exports
-            csv_prices = pxdf.to_csv(index=False).encode("utf-8")
+        # Export buttons
+        csv_prices = pxdf.to_csv(index=False).encode("utf-8")
+        st.download_button("Tải CSV giá", csv_prices, file_name=f"{raw_ticker}_prices.csv", mime="text/csv")
+        if 'nd' in locals():
             csv_news = nd.to_csv(index=False).encode("utf-8")
-            st.download_button("Tải CSV giá", csv_prices, file_name=f"{raw_ticker}_prices.csv", mime="text/csv")
             st.download_button("Tải CSV tin tức", csv_news, file_name=f"{raw_ticker}_news.csv", mime="text/csv")
 
         with st.expander("Nguồn & mẹo truy vấn"):
