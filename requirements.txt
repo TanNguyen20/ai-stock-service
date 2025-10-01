@@ -1,5 +1,7 @@
-streamlit==1.32.0
-pandas==2.2.2
-numpy==1.26.4
+streamlit
 vnstock
-plotly==6.3.0
+pandas
+plotly
+feedparser
+requests
+python-dateutil
