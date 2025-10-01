@@ -2,5 +2,4 @@ streamlit==1.32.0
 pandas==2.2.2
 numpy==1.26.4
 vnstock
-feedparser==6.0.12
 plotly==6.3.0
