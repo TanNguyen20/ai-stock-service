@@ -3,11 +3,11 @@
 VN Stock News–Price Analyzer (Vietnam-native prices via vnstock)
 
 - Prices: vnstock (daily OHLCV in VND) using Vnstock().stock(...).quote.history
-- News: Google News RSS (Vietnamese)
+- News: Google News RSS (Vietnamese); gracefully disabled if feedparser is missing
 - Sentiment: lightweight lexicon (optional transformer if installed)
 
 This file is defensive:
-- Plotly imports are guarded so the app doesn't crash if Plotly isn't installed.
+- Plotly and feedparser imports are guarded so the app doesn't crash if a lib is missing.
 - vnstock import is guarded with a helpful message.
 """
 
@@ -20,7 +20,6 @@ from typing import List, Optional, Tuple, Dict, Any
 import pandas as pd
 import numpy as np
 import streamlit as st
-import feedparser
 
 # ------------------------- Optional transformer (not required) -------------------------
 try:
@@ -42,6 +41,16 @@ except Exception as e:
     _PLOTLY_ERR = e
     go = px = make_subplots = None  # type: ignore
 
+# ------------------------- Safe Feedparser import -------------------------------------
+_HAS_FEEDPARSER = True
+_FEED_ERR = None
+try:
+    import feedparser  # type: ignore
+except Exception as e:
+    _HAS_FEEDPARSER = False
+    _FEED_ERR = e
+    feedparser = None  # type: ignore
+
 # ------------------------- Page & quick diagnostics -----------------------------------
 st.set_page_config(page_title="VN Stock News–Price Analyzer", layout="wide")
 with st.expander("Diagnostics (environment)"):
@@ -52,6 +61,8 @@ with st.expander("Diagnostics (environment)"):
         "numpy": np.__version__,
         "plotly_import_ok": _HAS_PLOTLY,
         "plotly_error": None if _HAS_PLOTLY else f"{type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR}",
+        "feedparser_import_ok": _HAS_FEEDPARSER,
+        "feedparser_error": None if _HAS_FEEDPARSER else f"{type(_FEED_ERR).__name__}: {_FEED_ERR}",
     })
 
 # If Plotly is missing, show a clear message and stop (so the app does not crash).
@@ -60,14 +71,14 @@ if not _HAS_PLOTLY:
         "Plotly is not available in the current environment.\n\n"
         "➡️ Ensure your **repo root** contains `requirements.txt` with `plotly==6.3.0`, "
         "then restart the app.\n\n"
-        "Example `requirements.txt` lines:\n"
+        "Your requirements.txt should include:\n"
         "    streamlit==1.32.0\n"
         "    pandas==2.2.2\n"
         "    numpy==1.26.4\n"
         "    vnstock\n"
         "    feedparser==6.0.12\n"
         "    plotly==6.3.0\n\n"
-        f"(Import error was: {type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR})"
+        f"(Plotly import error was: {type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR})"
     )
     st.stop()
 
@@ -82,6 +93,8 @@ class NewsItem:
     sentiment: Optional[float] = None  # -1..1
 
 def _coerce_dt(x: str) -> dt.datetime:
+    if not _HAS_FEEDPARSER:
+        return dt.datetime.utcnow()
     try:
         return dt.datetime(*feedparser._parse_date(x)[:6])  # type: ignore[attr-defined]
     except Exception:
@@ -92,6 +105,8 @@ def google_news_rss(query: str, days: int = 30, lang: str = "vi") -> str:
     return f"https://news.google.com/rss/search?q={q}+when:{days}d&hl={lang}&gl=VN&ceid=VN:{lang}"
 
 def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
+    if not _HAS_FEEDPARSER:
+        return []
     feed = feedparser.parse(google_news_rss(query, days=days))
     items: List[NewsItem] = []
     for e in feed.entries:
@@ -179,7 +194,6 @@ def _clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
         df = df.dropna(subset=keep_cols)
     if "Close" in df.columns:
         df = df[df["Close"] > 0]
-
     return df.sort_values("date").reset_index(drop=True)
 
 def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date, source: str = "VCI"
@@ -252,12 +266,12 @@ if run:
             st.dataframe(debug_log, use_container_width=True, hide_index=True)
 
         # Candlestick
-        st.subheader("Giá lịch sử")
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
             x=prices["date"], open=prices["Open"], high=prices["High"],
             low=prices["Low"], close=prices["Close"], name="Giá"))
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+        st.subheader("Giá lịch sử")
         st.plotly_chart(fig, use_container_width=True)
 
         # Returns
@@ -265,22 +279,33 @@ if run:
         pxdf["ret1"] = pxdf["Close"].pct_change()
         pxdf["ret5"] = pxdf["Close"].pct_change(5)
 
-        # News + sentiment
-        query = f"{raw_ticker} {company_hint}".strip()
-        news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
-        if news:
-            nd = pd.DataFrame([{
-                "date": pd.to_datetime(n.published).tz_localize(None).date(),
-                "published": pd.to_datetime(n.published).tz_localize(None),
-                "title": n.title, "summary": n.summary, "link": n.link,
-                "source": n.source, "sentiment": n.sentiment
-            } for n in news])
-            st.subheader("Tin tức & cảm xúc thị trường")
-            st.dataframe(nd[["published", "title", "source", "sentiment", "link"]]
-                         .sort_values("published", ascending=False),
-                         use_container_width=True, hide_index=True)
+        # News + sentiment (skip if feedparser missing)
+        if not _HAS_FEEDPARSER:
+            st.warning(
+                "Tin tức bị tắt vì thiếu thư viện **feedparser**.\n"
+                "➡️ Thêm `feedparser==6.0.12` vào `requirements.txt` tại repo root và khởi động lại."
+            )
+            nd = None
+        else:
+            query = f"{raw_ticker} {company_hint}".strip()
+            news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
+            if news:
+                nd = pd.DataFrame([{
+                    "date": pd.to_datetime(n.published).tz_localize(None).date(),
+                    "published": pd.to_datetime(n.published).tz_localize(None),
+                    "title": n.title, "summary": n.summary, "link": n.link,
+                    "source": n.source, "sentiment": n.sentiment
+                } for n in news])
+                st.subheader("Tin tức & cảm xúc thị trường")
+                st.dataframe(nd[["published", "title", "source", "sentiment", "link"]]
+                             .sort_values("published", ascending=False),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
+                nd = None
 
-            # Daily sentiment merge
+        # Sentiment overlay if we have news
+        if isinstance(nd, pd.DataFrame) and len(nd) > 0:
             daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment": "sent_daily"})
             daily_sent = daily_sent.rename(columns={"date": "news_date"})
             pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date
@@ -290,7 +315,6 @@ if run:
             merged["fwd_ret1"] = merged["ret1"].shift(-1)
             merged["fwd_ret5"] = merged["ret5"].shift(-5)
 
-            # Correlations
             def _safe_corr(a: str, b: str) -> float:
                 try:
                     v = merged[[a, b]].corr().iloc[0, 1]
@@ -304,7 +328,6 @@ if run:
                 f"MA3 sentiment → lợi suất 5 ngày tới = **{c5:.3f}**"
             )
 
-            # Overlay plot (close + MA3 sentiment)
             fig2 = make_subplots(specs=[[{"secondary_y": True}]])
             fig2.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)
             fig2.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)
@@ -319,9 +342,6 @@ if run:
                 title="Sentiment (MA3) vs. Lợi suất 5 ngày tới",
             )
             st.plotly_chart(scat, use_container_width=True)
-        else:
-            st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
-            nd = None
 
         # Exports
         st.download_button("Tải CSV giá", pxdf.to_csv(index=False).encode("utf-8"),
