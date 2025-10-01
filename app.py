@@ -2,27 +2,27 @@
 """
 VN Stock News–Price Analyzer (Vietnam-native prices via vnstock)
 
-- Prices: vnstock (daily OHLCV in VND) using the new Vnstock() interface
+- Prices: vnstock (daily OHLCV in VND) using Vnstock().stock(...).quote.history
 - News: Google News RSS (Vietnamese)
-- Sentiment: lightweight lexicon (optional transformer if you install it)
+- Sentiment: lightweight lexicon (optional transformer if installed)
+
+This file is defensive:
+- Plotly imports are guarded so the app doesn't crash if Plotly isn't installed.
+- vnstock import is guarded with a helpful message.
 """
 
-import sys
-import platform
+import sys, platform
 import datetime as dt
-import math
-import re
+import math, re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
 import feedparser
 
-# --- Optional transformer sentiment (leave uninstalled on Streamlit Cloud for speed) ---
+# ------------------------- Optional transformer (not required) -------------------------
 try:
     from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
     import torch  # type: ignore
@@ -30,20 +30,48 @@ try:
 except Exception:
     _HAS_TFM = False
 
-# -------------------------- Page & quick diagnostics -------------------------- #
+# ------------------------- Safe Plotly import (prevents hard crash) --------------------
+_HAS_PLOTLY = True
+_PLOTLY_ERR = None
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+except Exception as e:
+    _HAS_PLOTLY = False
+    _PLOTLY_ERR = e
+    go = px = make_subplots = None  # type: ignore
 
+# ------------------------- Page & quick diagnostics -----------------------------------
 st.set_page_config(page_title="VN Stock News–Price Analyzer", layout="wide")
-
 with st.expander("Diagnostics (environment)"):
     st.json({
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "pandas": pd.__version__,
         "numpy": np.__version__,
+        "plotly_import_ok": _HAS_PLOTLY,
+        "plotly_error": None if _HAS_PLOTLY else f"{type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR}",
     })
 
-# -------------------------- Data classes & helpers -------------------------- #
+# If Plotly is missing, show a clear message and stop (so the app does not crash).
+if not _HAS_PLOTLY:
+    st.error(
+        "Plotly is not available in the current environment.\n\n"
+        "➡️ Ensure your **repo root** contains `requirements.txt` with `plotly==6.3.0`, "
+        "then restart the app.\n\n"
+        "Example `requirements.txt` lines:\n"
+        "    streamlit==1.32.0\n"
+        "    pandas==2.2.2\n"
+        "    numpy==1.26.4\n"
+        "    vnstock\n"
+        "    feedparser==6.0.12\n"
+        "    plotly==6.3.0\n\n"
+        f"(Import error was: {type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR})"
+    )
+    st.stop()
 
+# ------------------------- Helpers & sentiment ----------------------------------------
 @dataclass
 class NewsItem:
     published: dt.datetime
@@ -51,7 +79,7 @@ class NewsItem:
     summary: str
     link: str
     source: str
-    sentiment: Optional[float] = None  # -1 .. 1
+    sentiment: Optional[float] = None  # -1..1
 
 def _coerce_dt(x: str) -> dt.datetime:
     try:
@@ -59,89 +87,12 @@ def _coerce_dt(x: str) -> dt.datetime:
     except Exception:
         return dt.datetime.utcnow()
 
-# -------------------------- VN price backend (vnstock) -------------------------- #
-
-def _clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize vnstock output to: date, Open, High, Low, Close, Volume (numeric), ascending by date.
-    """
-    df = df.copy()
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-    # vnstock usually returns 'time' as the datetime column
-    time_col = "time" if "time" in df.columns else ("date" if "date" in df.columns else None)
-    if time_col is None:
-        raise ValueError("vnstock returned data without a 'time' or 'date' column.")
-    df.rename(columns={time_col: "date"}, inplace=True)
-
-    rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close",
-                  "adj_close": "Adj Close", "volume": "Volume"}
-    for k, v in rename_map.items():
-        if k in df.columns:
-            df.rename(columns={k: v}, inplace=True)
-
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    keep_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
-    if keep_cols:
-        df = df.dropna(subset=keep_cols)
-    if "Close" in df.columns:
-        df = df[df["Close"] > 0]
-
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
-
-def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date, source: str = "VCI"
-                        ) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
-    """
-    Fetch daily OHLCV for a VN ticker using vnstock (Vnstock().stock(...).quote.history).
-    Returns (resolved_symbol, prices_df, debug_log_df).
-    """
-    attempts: List[Dict[str, Any]] = []
-    try:
-        # New unified interface
-        from vnstock import Vnstock  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to import 'vnstock'. Make sure requirements.txt lists 'vnstock' and "
-            "that the Python/NumPy/Pandas versions are compatible.\n"
-            f"Import error: {type(e).__name__}: {e}"
-        )
-
-    symbol = ticker.strip().upper()
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = end.strftime("%Y-%m-%d")
-
-    try:
-        stock = Vnstock().stock(symbol=symbol, source=source)
-        df = stock.quote.history(start=start_str, end=end_str, interval="1D")
-        n = int(len(df)) if isinstance(df, pd.DataFrame) else 0
-        attempts.append({"symbol": symbol, "method": f"Vnstock().stock(..., source='{source}').quote.history(1D)", "rows": n})
-        if n > 0:
-            cleaned = _clean_price_df(df)
-            if len(cleaned) > 0:
-                return symbol, cleaned, pd.DataFrame(attempts)
-    except Exception as e:
-        attempts.append({"symbol": symbol, "method": "vnstock history ERROR", "rows": 0, "msg": str(e)})
-
-    debug_df = pd.DataFrame(attempts)
-    raise RuntimeError(
-        f"No VN data returned for {symbol} (source={source}). "
-        "Check the ticker (e.g., HPG, VNM, FPT, MBS) and try a longer date range."
-    )
-
-# -------------------------- News & Sentiment -------------------------- #
-
 def google_news_rss(query: str, days: int = 30, lang: str = "vi") -> str:
     q = re.sub(r"\s+", "+", query.strip())
     return f"https://news.google.com/rss/search?q={q}+when:{days}d&hl={lang}&gl=VN&ceid=VN:{lang}"
 
 def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
-    url = google_news_rss(query, days=days)
-    feed = feedparser.parse(url)
+    feed = feedparser.parse(google_news_rss(query, days=days))
     items: List[NewsItem] = []
     for e in feed.entries:
         title = e.get("title", "").strip()
@@ -151,15 +102,15 @@ def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
         source_title = src.get("title", src) if isinstance(src, dict) else src
         published = _coerce_dt(e.get("published", ""))
         items.append(NewsItem(published, title, summary, link, source_title or ""))
-    # dedup by title
+    # Deduplicate by title
     dedup = {}
     for it in items:
-        key = it.title.lower()
-        if key not in dedup:
-            dedup[key] = it
+        k = it.title.lower()
+        if k not in dedup:
+            dedup[k] = it
     return sorted(dedup.values(), key=lambda x: x.published)
 
-# Simple Vietnamese lexicon (fallback if no transformer)
+# Simple Vietnamese lexicon (fallback sentiment)
 VI_POS = set("tăng|kỷ lục|tích cực|lợi nhuận|vượt|bứt phá|khả quan|mua ròng|đỉnh|bùng nổ|thuận lợi".split("|"))
 VI_NEG = set("giảm|tiêu cực|thua lỗ|lỗ|suy giảm|sụt|bán ròng|khó khăn|điều tra|phạt|rủi ro|đình chỉ|suy thoái|nợ xấu".split("|"))
 
@@ -202,17 +153,76 @@ def attach_sentiment(items: List[NewsItem]) -> List[NewsItem]:
         it.sentiment = score_sentiment(f"{it.title}. {it.summary}")
     return items
 
-# ------------------------------ UI ------------------------------ #
+# ------------------------- vnstock backend (defensive) --------------------------------
+def _clean_price_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize vnstock output to: date, Open, High, Low, Close, Volume (numeric)."""
+    df = df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    time_col = "time" if "time" in df.columns else ("date" if "date" in df.columns else None)
+    if time_col is None:
+        raise ValueError("vnstock returned data without a 'time' or 'date' column.")
+    df.rename(columns={time_col: "date"}, inplace=True)
 
+    rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close",
+                  "adj_close": "Adj Close", "volume": "Volume"}
+    for k, v in rename_map.items():
+        if k in df.columns:
+            df.rename(columns={k: v}, inplace=True)
+
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    keep_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+    if keep_cols:
+        df = df.dropna(subset=keep_cols)
+    if "Close" in df.columns:
+        df = df[df["Close"] > 0]
+
+    return df.sort_values("date").reset_index(drop=True)
+
+def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date, source: str = "VCI"
+                        ) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
+    """
+    Fetch daily OHLCV for a VN ticker using vnstock's Vnstock() interface.
+    Returns (resolved_symbol, prices_df, debug_log_df).
+    """
+    attempts: List[Dict[str, Any]] = []
+    try:
+        from vnstock import Vnstock  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to import 'vnstock'. Ensure your **repo root** requirements.txt includes 'vnstock' "
+            "and runtime.txt pins python-3.10.13.\n"
+            f"Underlying import error: {type(e).__name__}: {e}"
+        )
+
+    symbol = ticker.strip().upper()
+    start_str, end_str = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    try:
+        stock = Vnstock().stock(symbol=symbol, source=source)
+        df = stock.quote.history(start=start_str, end=end_str, interval="1D")
+        n = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+        attempts.append({"symbol": symbol, "method": f"quote.history(1D, source={source})", "rows": n})
+        if n > 0:
+            return symbol, _clean_price_df(df), pd.DataFrame(attempts)
+    except Exception as e:
+        attempts.append({"symbol": symbol, "method": "vnstock history ERROR", "rows": 0, "msg": str(e)})
+
+    raise RuntimeError(f"No VN data returned for {symbol}. Check ticker and date range.")
+
+# ------------------------- UI ---------------------------------------------------------
 st.title("🇻🇳 VN Stock News–Price Analyzer")
 st.caption("Dữ liệu giá từ nguồn Việt Nam (thư viện `vnstock`). Tin tức từ Google News (tiếng Việt).")
 
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
+c1, c2, c3 = st.columns([2, 1, 1])
+with c1:
     raw_ticker = st.text_input("Mã cổ phiếu (VD: HPG, VNM, MSN, FPT, MBS...)", value="HPG")
-with col2:
+with c2:
     lookback_days = st.number_input("Số ngày xem tin", value=30, min_value=7, max_value=365)
-with col3:
+with c3:
     date_range = st.date_input(
         "Khoảng thời gian giá",
         value=(dt.date.today() - dt.timedelta(days=365), dt.date.today()),
@@ -220,10 +230,10 @@ with col3:
         max_value=dt.date.today(),
     )
 
-col4, col5 = st.columns([1, 1])
-with col4:
+c4, c5 = st.columns([1, 1])
+with c4:
     provider = st.selectbox("Nguồn dữ liệu (vnstock)", ["VCI"], index=0)
-with col5:
+with c5:
     company_hint = st.text_input("Tên công ty (tùy chọn, tăng độ chính xác tìm tin)", value="Hòa Phát")
 
 run = st.button("Phân tích ngay", type="primary")
@@ -235,7 +245,7 @@ if run:
         else:
             start, end = dt.date.today() - dt.timedelta(days=365), dt.date.today()
 
-        # --- Prices from vnstock ---
+        # Prices
         resolved, prices, debug_log = load_prices_vietnam(raw_ticker, start, end, source=provider)
         st.success(f"Đã tìm thấy dữ liệu giá: {resolved} ({len(prices)} phiên)")
         with st.expander("Debug: thông tin tải giá"):
@@ -243,50 +253,39 @@ if run:
 
         # Candlestick
         st.subheader("Giá lịch sử")
-        fig_price = go.Figure()
-        fig_price.add_trace(go.Candlestick(
-            x=prices["date"],
-            open=prices["Open"],
-            high=prices["High"],
-            low=prices["Low"],
-            close=prices["Close"],
-            name="Giá",
-        ))
-        fig_price.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_price, use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=prices["date"], open=prices["Open"], high=prices["High"],
+            low=prices["Low"], close=prices["Close"], name="Giá"))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
         # Returns
         pxdf = prices.copy()
         pxdf["ret1"] = pxdf["Close"].pct_change()
         pxdf["ret5"] = pxdf["Close"].pct_change(5)
 
-        # --- News + sentiment ---
+        # News + sentiment
         query = f"{raw_ticker} {company_hint}".strip()
         news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
-        if not news:
-            st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
-        else:
+        if news:
             nd = pd.DataFrame([{
                 "date": pd.to_datetime(n.published).tz_localize(None).date(),
                 "published": pd.to_datetime(n.published).tz_localize(None),
                 "title": n.title, "summary": n.summary, "link": n.link,
                 "source": n.source, "sentiment": n.sentiment
             } for n in news])
-
             st.subheader("Tin tức & cảm xúc thị trường")
-            st.dataframe(
-                nd[["published", "title", "source", "sentiment", "link"]].sort_values("published", ascending=False),
-                use_container_width=True, hide_index=True
-            )
+            st.dataframe(nd[["published", "title", "source", "sentiment", "link"]]
+                         .sort_values("published", ascending=False),
+                         use_container_width=True, hide_index=True)
 
-            # Daily sentiment → merge
+            # Daily sentiment merge
             daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment": "sent_daily"})
             daily_sent = daily_sent.rename(columns={"date": "news_date"})
             pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date
             merged = pxdf.merge(daily_sent, left_on="date_only", right_on="news_date", how="left")
             merged["sent_daily"] = merged["sent_daily"].fillna(0.0)
-
-            # Rolling sentiment + forward returns
             merged["sent_roll3"] = merged["sent_daily"].rolling(3, min_periods=1).mean()
             merged["fwd_ret1"] = merged["ret1"].shift(-1)
             merged["fwd_ret5"] = merged["ret5"].shift(-5)
@@ -294,8 +293,8 @@ if run:
             # Correlations
             def _safe_corr(a: str, b: str) -> float:
                 try:
-                    val = merged[[a, b]].corr().iloc[0, 1]
-                    return 0.0 if math.isnan(val) else float(val)
+                    v = merged[[a, b]].corr().iloc[0, 1]
+                    return 0.0 if math.isnan(v) else float(v)
                 except Exception:
                     return 0.0
             c1 = _safe_corr("sent_daily", "fwd_ret1")
@@ -305,38 +304,31 @@ if run:
                 f"MA3 sentiment → lợi suất 5 ngày tới = **{c5:.3f}**"
             )
 
-            # Plot: Close + sentiment
-            from plotly.subplots import make_subplots
-            fig1 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)
-            fig1.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)
-            fig1.update_yaxes(title_text="Close", secondary_y=False)
-            fig1.update_yaxes(title_text="Sentiment (MA3)", secondary_y=True)
-            fig1.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig1, use_container_width=True)
+            # Overlay plot (close + MA3 sentiment)
+            fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig2.add_trace(go.Scatter(x=merged["date"], y=merged["Close"], name="Close"), secondary_y=False)
+            fig2.add_trace(go.Scatter(x=merged["date"], y=merged["sent_roll3"], name="Sentiment (MA3)"), secondary_y=True)
+            fig2.update_yaxes(title_text="Close", secondary_y=False)
+            fig2.update_yaxes(title_text="Sentiment (MA3)", secondary_y=True)
+            fig2.update_layout(height=350, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig2, use_container_width=True)
 
-            # Scatter (no trendline dependency)
             scat = px.scatter(
-                merged,
-                x="sent_roll3",
-                y="fwd_ret5",
+                merged, x="sent_roll3", y="fwd_ret5",
                 labels={"sent_roll3": "Sentiment (MA3)", "fwd_ret5": "Lợi suất 5 ngày tới"},
                 title="Sentiment (MA3) vs. Lợi suất 5 ngày tới",
             )
             st.plotly_chart(scat, use_container_width=True)
+        else:
+            st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
+            nd = None
 
         # Exports
-        csv_prices = pxdf.to_csv(index=False).encode("utf-8")
-        st.download_button("Tải CSV giá", csv_prices, file_name=f"{raw_ticker}_prices.csv", mime="text/csv")
-        if 'nd' in locals():
-            csv_news = nd.to_csv(index=False).encode("utf-8")
-            st.download_button("Tải CSV tin tức", csv_news, file_name=f"{raw_ticker}_news.csv", mime="text/csv")
-
-        with st.expander("Nguồn & mẹo truy vấn"):
-            st.markdown(
-                "- Giá: Nguồn Việt Nam qua thư viện `vnstock` (VND).\n"
-                "- Tin tức: Google News RSS — thêm tên DN/từ khóa ‘kqkd’, ‘cổ tức’, ‘trái phiếu’ để chính xác hơn."
-            )
+        st.download_button("Tải CSV giá", pxdf.to_csv(index=False).encode("utf-8"),
+                           file_name=f"{raw_ticker}_prices.csv", mime="text/csv")
+        if isinstance(nd, pd.DataFrame):
+            st.download_button("Tải CSV tin tức", nd.to_csv(index=False).encode("utf-8"),
+                               file_name=f"{raw_ticker}_news.csv", mime="text/csv")
 
     except Exception as e:
         st.error(f"Lỗi: {e}")
