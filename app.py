@@ -5,6 +5,7 @@
 # - Price history via vnstock with source fallback (VCI → TCBS → SSI)
 # - Candlestick + SMA overlays, 1W/1M/3M returns
 # - News via Google News RSS (Vietstock, CafeF, NDH, VnEconomy, VnExpress Biz)
+# - FIX: URL-encode Google News query to avoid http.client.InvalidURL
 # -----------------------------------------------------------
 
 import streamlit as st
@@ -15,6 +16,7 @@ from dateutil import parser as dtparser
 import time
 import re
 import feedparser
+from urllib.parse import urlencode, quote_plus
 
 # vnstock unified API
 # If your vnstock is older, upgrade: pip install -U vnstock
@@ -27,6 +29,9 @@ st.set_page_config(page_title="Vietnam Stock + News Analyzer", layout="wide")
 # Utilities & Caching
 # =========================
 
+_CONTROL_CHARS_REGEX = re.compile(r"[\x00-\x1f\x7f]")  # remove control chars that break URLs
+
+
 def _strip_accents(text: str) -> str:
     try:
         import unicodedata
@@ -38,35 +43,31 @@ def _strip_accents(text: str) -> str:
         return text
 
 
+def _sanitize_query_for_url(q: str) -> str:
+    """Remove control chars and collapse whitespace for safer URL building."""
+    if not isinstance(q, str):
+        q = str(q)
+    q = _CONTROL_CHARS_REGEX.sub(" ", q)
+    q = " ".join(q.split())
+    return q
+
+
 @st.cache_data(show_spinner=False)
 def get_all_symbols_df() -> pd.DataFrame:
     """
     Pull all symbols for lookup. vnstock provides various listing helpers
-    depending on version; we try a couple of approaches.
+    depending on version; we try a unified approach first.
     """
     try:
-        # Attempt 1: unified listing
         from vnstock import Listing
         listing = Listing()
         df = listing.all_symbols()  # expected DataFrame
         if isinstance(df, pd.DataFrame) and not df.empty:
-            # normalize column names to lower-case
             df = df.copy()
             df.columns = [c.lower() for c in df.columns]
             return df
     except Exception:
         pass
-
-    # Attempt 2: via Vnstock meta if available (fallback)
-    try:
-        vn = Vnstock()
-        # Some builds expose a metadata method
-        if hasattr(vn, "stock") and hasattr(vn, "listing"):
-            # Not guaranteed; left for future compatibility
-            pass
-    except Exception:
-        pass
-
     return pd.DataFrame()
 
 
@@ -76,7 +77,7 @@ def resolve_symbol(user_text: str) -> str | None:
     Accepts: 'HPG', 'Hòa Phát', 'MSR', 'Masan', ...
     Returns: ticker code if found else None
     """
-    s = user_text.strip()
+    s = (user_text or "").strip()
     if not s:
         return None
 
@@ -216,35 +217,56 @@ VN_NEWS_SITES = [
 
 
 @st.cache_data(show_spinner=False)
-def fetch_news_headlines(query_text: str, limit: int = 20) -> pd.DataFrame:
-    q = f"{query_text} ({' OR '.join(VN_NEWS_SITES)})"
-    rss = f"https://news.google.com/rss/search?q={q}&hl=vi-VN&gl=VN&ceid=VN:vi"
-    feed = feedparser.parse(rss)
-    items = []
-    for entry in (feed.entries or [])[:limit]:
-        pub = None
-        for key in ("published", "updated", "pubDate"):
-            if key in entry:
-                try:
-                    pub = dtparser.parse(entry[key])
-                    break
-                except Exception:
-                    pass
-        src_title = None
-        if isinstance(entry.get("source"), dict):
-            src_title = entry["source"].get("title")
-        items.append({
-            "title": entry.get("title"),
-            "link": entry.get("link"),
-            "published": pub,
-            "source": src_title,
-            "summary": entry.get("summary"),
-        })
+def fetch_news_headlines(query_text: str, limit: int = 20):
+    """
+    Return (DataFrame, error_str). On success, error_str=None.
+    Build a URL-encoded Google News RSS query to prevent InvalidURL.
+    """
+    try:
+        # Build a clean, encoded query
+        base = "https://news.google.com/rss/search"
+        # Remove control characters & tidy whitespace
+        safe_query = _sanitize_query_for_url(query_text or "")
+        sites_qualifier = " OR ".join(VN_NEWS_SITES)
+        q_raw = f"{safe_query} ({sites_qualifier})"
 
-    df = pd.DataFrame(items)
-    if not df.empty and "published" in df:
-        df = df.sort_values("published", ascending=False)
-    return df
+        # urlencode with quote_plus to safely encode spaces, parentheses, accents, etc.
+        params = {
+            "q": q_raw,
+            "hl": "vi-VN",
+            "gl": "VN",
+            "ceid": "VN:vi",
+        }
+        rss_url = base + "?" + urlencode(params, quote_via=quote_plus)
+
+        feed = feedparser.parse(rss_url)
+        items = []
+        for entry in (feed.entries or [])[:limit]:
+            pub = None
+            for key in ("published", "updated", "pubDate"):
+                if key in entry:
+                    try:
+                        pub = dtparser.parse(entry[key])
+                        break
+                    except Exception:
+                        pass
+            src_title = None
+            if isinstance(entry.get("source"), dict):
+                src_title = entry["source"].get("title")
+            items.append({
+                "title": entry.get("title"),
+                "link": entry.get("link"),
+                "published": pub,
+                "source": src_title,
+                "summary": entry.get("summary"),
+            })
+        df = pd.DataFrame(items)
+        if not df.empty and "published" in df:
+            df = df.sort_values("published", ascending=False)
+        return df, None
+    except Exception as e:
+        # Return empty df + error string (do not raise inside cache)
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
 
 
 # =========================
@@ -333,13 +355,23 @@ news_query = st.text_input(
     value=f"{resolved} OR {user_input}",
     help="Refine if needed (e.g., add parent group name, sector, or keywords)."
 )
-news_df = fetch_news_headlines(news_query, limit=30)
+
+# Fetch headlines (returns df, error_str)
+news_df, news_err = fetch_news_headlines(news_query, limit=30)
+
+if news_err:
+    st.warning(
+        "Could not fetch news via Google News RSS right now.\n\n"
+        f"Details: {news_err}\n\n"
+        "Tip: Try simplifying the query (letters/numbers only) or retry shortly."
+    )
 
 if news_df.empty:
     st.info("No recent news found from common VN finance sources. Try broadening the query.")
 else:
     # Pair headlines with nearest daily return
     daily_ret = hist["close"].pct_change().rename("ret") if "close" in hist.columns else pd.Series(dtype=float)
+
     def nearest_return(dt):
         try:
             if pd.isna(dt) or daily_ret.empty:
