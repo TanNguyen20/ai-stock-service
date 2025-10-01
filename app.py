@@ -2,20 +2,21 @@
 """
 VN Stock News–Price Analyzer (Vietnam-native prices via vnstock)
 
-- Prices: vnstock (daily OHLCV in VND) using Vnstock().stock(...).quote.history
-- News: Google News RSS (Vietnamese); gracefully disabled if feedparser is missing
+- Prices: vnstock (daily OHLCV in VND), Vnstock().stock(...).quote.history
+- News: Google News RSS (Vietnamese) parsed with Python stdlib (no feedparser)
 - Sentiment: lightweight lexicon (optional transformer if installed)
 
-This file is defensive:
-- Plotly and feedparser imports are guarded so the app doesn't crash if a lib is missing.
-- vnstock import is guarded with a helpful message.
+Defensive design:
+- Plotly and vnstock imports are guarded with helpful UI messages instead of hard crashing.
 """
 
 import sys, platform
 import datetime as dt
-import math, re
+from email.utils import parsedate_to_datetime
+import math, re, urllib.parse, urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import numpy as np
@@ -41,16 +42,6 @@ except Exception as e:
     _PLOTLY_ERR = e
     go = px = make_subplots = None  # type: ignore
 
-# ------------------------- Safe Feedparser import -------------------------------------
-_HAS_FEEDPARSER = True
-_FEED_ERR = None
-try:
-    import feedparser  # type: ignore
-except Exception as e:
-    _HAS_FEEDPARSER = False
-    _FEED_ERR = e
-    feedparser = None  # type: ignore
-
 # ------------------------- Page & quick diagnostics -----------------------------------
 st.set_page_config(page_title="VN Stock News–Price Analyzer", layout="wide")
 with st.expander("Diagnostics (environment)"):
@@ -61,24 +52,13 @@ with st.expander("Diagnostics (environment)"):
         "numpy": np.__version__,
         "plotly_import_ok": _HAS_PLOTLY,
         "plotly_error": None if _HAS_PLOTLY else f"{type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR}",
-        "feedparser_import_ok": _HAS_FEEDPARSER,
-        "feedparser_error": None if _HAS_FEEDPARSER else f"{type(_FEED_ERR).__name__}: {_FEED_ERR}",
     })
 
-# If Plotly is missing, show a clear message and stop (so the app does not crash).
 if not _HAS_PLOTLY:
     st.error(
-        "Plotly is not available in the current environment.\n\n"
-        "➡️ Ensure your **repo root** contains `requirements.txt` with `plotly==6.3.0`, "
-        "then restart the app.\n\n"
-        "Your requirements.txt should include:\n"
-        "    streamlit==1.32.0\n"
-        "    pandas==2.2.2\n"
-        "    numpy==1.26.4\n"
-        "    vnstock\n"
-        "    feedparser==6.0.12\n"
-        "    plotly==6.3.0\n\n"
-        f"(Plotly import error was: {type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR})"
+        "Plotly is not available.\n\n"
+        "➡️ Ensure repo-root `requirements.txt` includes `plotly==6.3.0`, then restart.\n\n"
+        f"(Import error: {type(_PLOTLY_ERR).__name__}: {_PLOTLY_ERR})"
     )
     st.stop()
 
@@ -92,11 +72,13 @@ class NewsItem:
     source: str
     sentiment: Optional[float] = None  # -1..1
 
-def _coerce_dt(x: str) -> dt.datetime:
-    if not _HAS_FEEDPARSER:
-        return dt.datetime.utcnow()
+def _clean_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", " ", text or "").strip()
+
+def _coerce_dt(pubdate_text: str) -> dt.datetime:
+    # pubDate in RSS often like "Mon, 30 Sep 2025 09:32:00 GMT"
     try:
-        return dt.datetime(*feedparser._parse_date(x)[:6])  # type: ignore[attr-defined]
+        return parsedate_to_datetime(pubdate_text).replace(tzinfo=None)
     except Exception:
         return dt.datetime.utcnow()
 
@@ -104,19 +86,41 @@ def google_news_rss(query: str, days: int = 30, lang: str = "vi") -> str:
     q = re.sub(r"\s+", "+", query.strip())
     return f"https://news.google.com/rss/search?q={q}+when:{days}d&hl={lang}&gl=VN&ceid=VN:{lang}"
 
+def _fetch_url(url: str, timeout: int = 15) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; VNStockApp/1.0)"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
 def fetch_news(query: str, days: int = 30) -> List[NewsItem]:
-    if not _HAS_FEEDPARSER:
+    url = google_news_rss(query, days=days)
+    try:
+        data = _fetch_url(url)
+        root = ET.fromstring(data)
+    except Exception:
         return []
-    feed = feedparser.parse(google_news_rss(query, days=days))
+
+    # Google News RSS typically: <rss><channel><item>...</item></channel></rss>
+    ns = {}  # not using namespaces here
     items: List[NewsItem] = []
-    for e in feed.entries:
-        title = e.get("title", "").strip()
-        summary = re.sub(r"<[^>]+>", " ", e.get("summary", "").strip())
-        link = e.get("link", "")
-        src = e.get("source", {})
-        source_title = src.get("title", src) if isinstance(src, dict) else src
-        published = _coerce_dt(e.get("published", ""))
-        items.append(NewsItem(published, title, summary, link, source_title or ""))
+    for item in root.findall(".//item", ns):
+        title = item.findtext("title", default="").strip()
+        link = item.findtext("link", default="").strip()
+        pubdate = item.findtext("pubDate", default="").strip()
+        source = item.findtext("{*}source") or ""  # sometimes namespaced
+        description = item.findtext("description", default="").strip()
+
+        items.append(NewsItem(
+            published=_coerce_dt(pubdate),
+            title=title,
+            summary=_clean_html(description),
+            link=link,
+            source=source.strip(),
+        ))
+
     # Deduplicate by title
     dedup = {}
     for it in items:
@@ -207,8 +211,8 @@ def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date, source: str =
         from vnstock import Vnstock  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "Failed to import 'vnstock'. Ensure your **repo root** requirements.txt includes 'vnstock' "
-            "and runtime.txt pins python-3.10.13.\n"
+            "Failed to import 'vnstock'. Ensure repo-root `requirements.txt` includes 'vnstock' "
+            "and `runtime.txt` pins python-3.10.13.\n"
             f"Underlying import error: {type(e).__name__}: {e}"
         )
 
@@ -229,7 +233,7 @@ def load_prices_vietnam(ticker: str, start: dt.date, end: dt.date, source: str =
 
 # ------------------------- UI ---------------------------------------------------------
 st.title("🇻🇳 VN Stock News–Price Analyzer")
-st.caption("Dữ liệu giá từ nguồn Việt Nam (thư viện `vnstock`). Tin tức từ Google News (tiếng Việt).")
+st.caption("Giá: vnstock (VND). Tin tức: Google News RSS (không cần feedparser).")
 
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
@@ -279,33 +283,22 @@ if run:
         pxdf["ret1"] = pxdf["Close"].pct_change()
         pxdf["ret5"] = pxdf["Close"].pct_change(5)
 
-        # News + sentiment (skip if feedparser missing)
-        if not _HAS_FEEDPARSER:
-            st.warning(
-                "Tin tức bị tắt vì thiếu thư viện **feedparser**.\n"
-                "➡️ Thêm `feedparser==6.0.12` vào `requirements.txt` tại repo root và khởi động lại."
-            )
-            nd = None
-        else:
-            query = f"{raw_ticker} {company_hint}".strip()
-            news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
-            if news:
-                nd = pd.DataFrame([{
-                    "date": pd.to_datetime(n.published).tz_localize(None).date(),
-                    "published": pd.to_datetime(n.published).tz_localize(None),
-                    "title": n.title, "summary": n.summary, "link": n.link,
-                    "source": n.source, "sentiment": n.sentiment
-                } for n in news])
-                st.subheader("Tin tức & cảm xúc thị trường")
-                st.dataframe(nd[["published", "title", "source", "sentiment", "link"]]
-                             .sort_values("published", ascending=False),
-                             use_container_width=True, hide_index=True)
-            else:
-                st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
-                nd = None
+        # News + sentiment
+        query = f"{raw_ticker} {company_hint}".strip()
+        news = attach_sentiment(fetch_news(query, days=int(lookback_days)))
+        if news:
+            nd = pd.DataFrame([{
+                "date": pd.to_datetime(n.published).tz_localize(None).date(),
+                "published": pd.to_datetime(n.published).tz_localize(None),
+                "title": n.title, "summary": n.summary, "link": n.link,
+                "source": n.source, "sentiment": n.sentiment
+            } for n in news])
+            st.subheader("Tin tức & cảm xúc thị trường")
+            st.dataframe(nd[["published", "title", "source", "sentiment", "link"]]
+                         .sort_values("published", ascending=False),
+                         use_container_width=True, hide_index=True)
 
-        # Sentiment overlay if we have news
-        if isinstance(nd, pd.DataFrame) and len(nd) > 0:
+            # Daily sentiment merge
             daily_sent = nd.groupby("date")["sentiment"].mean().reset_index().rename(columns={"sentiment": "sent_daily"})
             daily_sent = daily_sent.rename(columns={"date": "news_date"})
             pxdf["date_only"] = pd.to_datetime(pxdf["date"]).dt.date
@@ -342,6 +335,9 @@ if run:
                 title="Sentiment (MA3) vs. Lợi suất 5 ngày tới",
             )
             st.plotly_chart(scat, use_container_width=True)
+        else:
+            st.warning("Không tìm thấy bài viết nào cho từ khóa đã chọn.")
+            nd = None
 
         # Exports
         st.download_button("Tải CSV giá", pxdf.to_csv(index=False).encode("utf-8"),
