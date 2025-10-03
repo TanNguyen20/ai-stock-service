@@ -654,7 +654,7 @@ with st.expander("Scan settings"):
     with colr1:
         if st.button("↻ Refresh symbols"):
             st.cache_data.clear()   # clear cached listing & other data
-            st.experimental_rerun()
+            st.rerun()
     # Optional diagnostics
     err = st.session_state.get("symbols_error")
     if err:
