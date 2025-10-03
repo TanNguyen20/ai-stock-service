@@ -9,7 +9,7 @@
 #    * Price-only: Holt-Winters, ARIMA(1,1,1), SMA, Naive
 #    * News-aware (optional): ARIMAX with headline sentiment as exogenous input
 # - Recommender: N-day-low + rebound screener
-# - Robust listings: retries, TTL cache, manual refresh, disk fallback universe
+# - Robust listings: reads symbols.csv (preferred) → parquet cache → live Listing()
 # - UI debug logger (instead of print) to view diagnostics in the page
 # -----------------------------------------------------------
 
@@ -65,29 +65,50 @@ FALLBACK_UNIVERSE = [
     "SSI","VND","TCI","SHS","VIX","HCM","VCI","FTS"
 ]
 
-# On-disk symbols cache (survives cold boots on Streamlit Cloud)
-SYMBOLS_CACHE_PATH = "symbols_cache.parquet"
+# On-disk symbols files (in the same folder as app.py)
+SYMBOLS_CSV_PATH = "symbols.csv"
+SYMBOLS_PARQUET_PATH = "symbols_cache.parquet"
 
-def _load_symbols_cache() -> pd.DataFrame:
+def _normalize_symbols_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+    if "symbol" not in df.columns:
+        raise ValueError("Symbols file is missing required 'symbol' column.")
+    # keep only sensible columns; symbol is required, names are optional
+    df = df.drop_duplicates(subset=["symbol"])
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df = df[df["symbol"].str.fullmatch(r"[A-Z0-9]{2,6}")]
+    return df.sort_values("symbol").reset_index(drop=True)
+
+def _load_symbols_csv() -> pd.DataFrame:
     try:
-        if os.path.exists(SYMBOLS_CACHE_PATH):
-            df = pd.read_parquet(SYMBOLS_CACHE_PATH)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df = df.copy()
-                df.columns = [c.lower() for c in df.columns]
-                _log(f"[cache] Loaded symbols_cache.parquet with shape={df.shape}")
-                return df
+        if os.path.exists(SYMBOLS_CSV_PATH):
+            df = pd.read_csv(SYMBOLS_CSV_PATH)
+            df = _normalize_symbols_df(df)
+            _log(f"[symbols.csv] Loaded {len(df)} rows from {SYMBOLS_CSV_PATH}")
+            return df
     except Exception as e:
-        _log(f"[cache] Failed to read symbols_cache.parquet: {e}")
+        _log(f"[symbols.csv] Failed to read {SYMBOLS_CSV_PATH}: {e}")
     return pd.DataFrame()
 
-def _save_symbols_cache(df: pd.DataFrame) -> None:
+def _load_symbols_parquet() -> pd.DataFrame:
+    try:
+        if os.path.exists(SYMBOLS_PARQUET_PATH):
+            df = pd.read_parquet(SYMBOLS_PARQUET_PATH)
+            df = _normalize_symbols_df(df)
+            _log(f"[cache] Loaded {len(df)} rows from {SYMBOLS_PARQUET_PATH}")
+            return df
+    except Exception as e:
+        _log(f"[cache] Failed to read {SYMBOLS_PARQUET_PATH}: {e}")
+    return pd.DataFrame()
+
+def _save_symbols_parquet(df: pd.DataFrame) -> None:
     try:
         if isinstance(df, pd.DataFrame) and not df.empty:
-            df.to_parquet(SYMBOLS_CACHE_PATH, index=False)
-            _log(f"[cache] Saved symbols_cache.parquet with shape={df.shape}")
+            df.to_parquet(SYMBOLS_PARQUET_PATH, index=False)
+            _log(f"[cache] Saved symbols to {SYMBOLS_PARQUET_PATH} (rows={len(df)})")
     except Exception as e:
-        _log(f"[cache] Failed to save symbols_cache.parquet: {e}")
+        _log(f"[cache] Failed to save {SYMBOLS_PARQUET_PATH}: {e}")
 
 _CONTROL_CHARS_REGEX = re.compile(r"[\x00-\x1f\x7f]")  # remove control chars that break URLs
 
@@ -110,13 +131,26 @@ def _sanitize_query_for_url(q: str) -> str:
     q = " ".join(q.split())
     return q
 
-# TTL so it refreshes periodically; on failure use disk cache; raise if nothing
-@st.cache_data(show_spinner=False, ttl=3600, persist="disk")
+# Prefer CSV → Parquet → Live API (with retries). If all fail, raise.
+@st.cache_data(show_spinner=False, ttl=3600)
 def get_all_symbols_df() -> pd.DataFrame:
     """
-    Try live vnstock Listing() (with retries). On failure, use a disk cache if available.
-    If both fail, raise so caller can fall back to VN30 universe.
+    Load symbols from local CSV (preferred), then parquet cache, then live vnstock Listing().
+    If live succeeds, we persist to parquet for future runs.
     """
+    # 1) Try CSV first
+    csv_df = _load_symbols_csv()
+    if not csv_df.empty:
+        st.session_state["symbols_error"] = None
+        return csv_df
+
+    # 2) Try Parquet cache
+    pq_df = _load_symbols_parquet()
+    if not pq_df.empty:
+        st.session_state["symbols_error"] = "Using cached symbols (no symbols.csv present)."
+        return pq_df
+
+    # 3) Try live Listing() as last resort
     try:
         from vnstock import Listing
         listing = Listing()
@@ -125,12 +159,11 @@ def get_all_symbols_df() -> pd.DataFrame:
             try:
                 _log(f"[listing] Attempt {attempt} → Listing().all_symbols()")
                 df = listing.all_symbols()
-                _log(f"[listing] Raw shape: {getattr(df, 'shape', None)}")
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    df = df.copy()
-                    df.columns = [c.lower() for c in df.columns]
+                    df = _normalize_symbols_df(df)
                     st.session_state["symbols_error"] = None
-                    _save_symbols_cache(df)  # Persist for offline/rate-limited runs
+                    _save_symbols_parquet(df)  # persist for future offline/rate-limited runs
+                    _log(f"[listing] Live fetch succeeded. rows={len(df)}")
                     return df
                 time.sleep(0.5)
             except Exception as e:
@@ -141,21 +174,10 @@ def get_all_symbols_df() -> pd.DataFrame:
         msg = f"Empty/failed listing response. Last error: {type(last_exc).__name__}: {last_exc}" if last_exc else "Empty listing response."
         st.session_state["symbols_error"] = msg
         _log(f"[listing] Live fetch failed. {msg}")
-
-        # Disk cache fallback
-        cache_df = _load_symbols_cache()
-        if not cache_df.empty:
-            st.session_state["symbols_error"] = f"{msg} · Using cached symbols on disk."
-            return cache_df
-
-        raise RuntimeError(msg)  # nothing to return
+        raise RuntimeError(msg)
     except Exception as e:
         st.session_state["symbols_error"] = f"{type(e).__name__}: {e}"
         _log(f"[listing] Unexpected error: {e}")
-        cache_df = _load_symbols_cache()
-        if not cache_df.empty:
-            st.session_state["symbols_error"] += " · Using cached symbols on disk."
-            return cache_df
         raise
 
 @st.cache_data(show_spinner=False)
@@ -758,7 +780,7 @@ def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]
         arr = _parse_custom_list(custom_text)
         return arr[:limit] if limit else arr
 
-    # Try live listings; on failure/empty, we fall back
+    # Try CSV/Parquet/Live via helper; on failure/empty, we fall back
     try:
         df = get_all_symbols_df()
         sym_col = "symbol" if "symbol" in df.columns else df.columns[0]
@@ -795,14 +817,15 @@ if run_scan:
         if err:
             st.caption(f"Listing diagnostics: {err}")
     else:
-        # Note when fallback was used
-        used_fallback = False
+        # Note when non-CSV fallback was used
+        used_non_csv = False
         try:
-            _ = get_all_symbols_df()  # will raise if listing failed (meaning fallback used)
+            df_chk = get_all_symbols_df()
+            used_non_csv = not os.path.exists(SYMBOLS_CSV_PATH) and not df_chk.empty
         except Exception:
-            used_fallback = True
-        if universe_mode == "All symbols (auto)" and used_fallback:
-            st.caption("Using fallback universe (VN30/liquid HOSE) because listings were unavailable.")
+            used_non_csv = True
+        if universe_mode == "All symbols (auto)" and used_non_csv:
+            st.caption("Universe loaded from cache or live API (symbols.csv not found).")
 
         rows = []
         progress = st.progress(0.0, text="Scanning…")
