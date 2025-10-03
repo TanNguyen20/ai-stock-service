@@ -1,14 +1,14 @@
 # app.py
 # Vietnam Stock Pricing + News Analyzer (Streamlit + vnstock)
 # -----------------------------------------------------------
-# - Resolve ticker from Vietnamese/English company names
+# - Resolve ticker from Vietnamese/English company names (alphanumeric tickers OK: TV2, FRT…)
 # - Price history via vnstock with source fallback (VCI → TCBS → SSI) + retries
 # - Candlestick + SMA overlays, 1W/1M/3M returns
 # - News via Google News RSS (URL-encoded to avoid InvalidURL)
 # - Forecasts:
 #    * Price-only: Holt-Winters, ARIMA(1,1,1), SMA, Naive
-#    * News-aware (optional): ARIMAX (SARIMAX) with headline sentiment as exogenous input
-# - NEW: Recommender — tickers near N-day low with rebound signals
+#    * News-aware (optional): ARIMAX with headline sentiment as exogenous input
+# - Recommender: N-day-low + rebound screener
 # -----------------------------------------------------------
 
 import streamlit as st
@@ -21,12 +21,10 @@ import re
 import feedparser
 from urllib.parse import urlencode, quote_plus
 
-# Numeric/Stats
 import numpy as np
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 
-# Optional (loaded lazily / guarded)
 _TRANSFORMERS_OK = True
 _SARIMAX_OK = True
 try:
@@ -38,7 +36,6 @@ try:
 except Exception:
     _SARIMAX_OK = False
 
-# vnstock unified API
 from vnstock import Vnstock
 
 st.set_page_config(page_title="Vietnam Stock + News + Forecast", layout="wide")
@@ -50,6 +47,7 @@ st.set_page_config(page_title="Vietnam Stock + News + Forecast", layout="wide")
 _CONTROL_CHARS_REGEX = re.compile(r"[\x00-\x1f\x7f]")  # remove control chars that break URLs
 
 def _strip_accents(text: str) -> str:
+    # Remove Vietnamese diacritics for fuzzy matching
     try:
         import unicodedata
         return "".join(
@@ -60,7 +58,7 @@ def _strip_accents(text: str) -> str:
         return text
 
 def _sanitize_query_for_url(q: str) -> str:
-    """Remove control chars and collapse whitespace for safer URL building."""
+    # Remove control chars and collapse whitespace for safe URLs
     if not isinstance(q, str):
         q = str(q)
     q = _CONTROL_CHARS_REGEX.sub(" ", q)
@@ -69,9 +67,7 @@ def _sanitize_query_for_url(q: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def get_all_symbols_df() -> pd.DataFrame:
-    """
-    Pull all symbols for lookup via vnstock Listing().
-    """
+    # Pull all symbols for lookup via vnstock Listing()
     try:
         from vnstock import Listing
         listing = Listing()
@@ -86,15 +82,12 @@ def get_all_symbols_df() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def resolve_symbol(user_text: str) -> str | None:
-    """
-    Accepts: 'HPG', 'Hòa Phát', 'MSR', 'Masan', 'TV2', ...
-    Returns: ticker code if found else None
-    """
+    # Accept: HPG, Hòa Phát, MSR, Masan, TV2, etc. Return ticker if found
     s = (user_text or "").strip()
     if not s:
         return None
 
-    # Allow letters or digits, 2–6 chars (so TV2 works)
+    # Allow alphanumeric tickers (2–6 chars), e.g., TV2
     if re.fullmatch(r"[A-Za-z0-9]{2,6}", s):
         return s.upper()
 
@@ -137,11 +130,7 @@ def load_history(
     retries_per_source: int = 2,
     backoff_sec: float = 0.8,
 ) -> pd.DataFrame:
-    """
-    Get daily OHLCV for [start, end] with resilient fallback across sources.
-    Returns a DataFrame indexed by datetime with columns: open, high, low, close, volume, ...
-    Adds df.attrs['source'] = effective_source
-    """
+    # Fetch OHLCV for [start, end] with fallback sources
     vn = Vnstock()
     sources = [source] if source not in (None, "", "Auto") else ["VCI", "TCBS", "SSI"]
     last_err = None
@@ -214,10 +203,7 @@ VN_NEWS_SITES = [
 
 @st.cache_data(show_spinner=False)
 def fetch_news_headlines(query_text: str, limit: int = 20):
-    """
-    Return (DataFrame, error_str). On success, error_str=None.
-    URL-encodes query to avoid InvalidURL.
-    """
+    # Safely build a Google News RSS query (URL-encoded)
     try:
         base = "https://news.google.com/rss/search"
         safe_query = _sanitize_query_for_url(query_text or "")
@@ -259,6 +245,7 @@ def fetch_news_headlines(query_text: str, limit: int = 20):
 # =========================
 
 def _prep_close_series(df: pd.DataFrame):
+    # Clean daily close series on business days
     s = df["close"].dropna().copy()
     s.index = pd.to_datetime(s.index)
     s = s.sort_index()
@@ -273,9 +260,7 @@ def _recent_volatility(s: pd.Series, window: int = 21):
     return float(r.tail(window).std())
 
 def make_forecast(s: pd.Series, horizon_days: int, method: str = "Holt-Winters"):
-    """
-    Return a DataFrame with index future business days and columns: yhat, lower, upper
-    """
+    # Return DataFrame (yhat, lower, upper) for next business days
     horizon_days = int(horizon_days)
     future_idx = pd.bdate_range(s.index[-1] + pd.tseries.offsets.BDay(1), periods=horizon_days, freq="B")
     vol = _recent_volatility(s)
@@ -285,18 +270,14 @@ def make_forecast(s: pd.Series, horizon_days: int, method: str = "Holt-Winters")
         yhat = pd.Series(last, index=future_idx)
         steps = np.arange(1, horizon_days + 1)
         band = 1.65 * last * vol * np.sqrt(steps)
-        lower = yhat.values - band
-        upper = yhat.values + band
-        return pd.DataFrame({"yhat": yhat, "lower": lower, "upper": upper}, index=future_idx)
+        return pd.DataFrame({"yhat": yhat, "lower": yhat.values - band, "upper": yhat.values + band}, index=future_idx)
 
     if method == "SMA (window=20)":
         sma = s.rolling(20).mean().iloc[-1]
         yhat = pd.Series(float(sma), index=future_idx)
         steps = np.arange(1, horizon_days + 1)
         band = 1.65 * float(s.iloc[-1]) * vol * np.sqrt(steps)
-        lower = yhat.values - band
-        upper = yhat.values + band
-        return pd.DataFrame({"yhat": yhat, "lower": lower, "upper": upper}, index=future_idx)
+        return pd.DataFrame({"yhat": yhat, "lower": yhat.values - band, "upper": yhat.values + band}, index=future_idx)
 
     if method == "Holt-Winters":
         try:
@@ -307,29 +288,22 @@ def make_forecast(s: pd.Series, horizon_days: int, method: str = "Holt-Winters")
             sigma = float(resid.dropna().std())
             steps = np.arange(1, horizon_days + 1)
             band = 1.65 * sigma * np.sqrt(steps)
-            lower = fc.values - band
-            upper = fc.values + band
-            return pd.DataFrame({"yhat": fc, "lower": lower, "upper": upper}, index=future_idx)
+            return pd.DataFrame({"yhat": fc, "lower": fc.values - band, "upper": fc.values + band}, index=future_idx)
         except Exception:
             pass
 
-    # ARIMA(1,1,1)
     try:
         model = ARIMA(s, order=(1, 1, 1))
         fit = model.fit()
         pred = fit.get_forecast(steps=horizon_days)
         mean = pred.predicted_mean
         conf = pred.conf_int(alpha=0.10)  # ~90%
-        lower = conf.iloc[:, 0]
-        upper = conf.iloc[:, 1]
-        return pd.DataFrame({"yhat": mean, "lower": lower, "upper": upper}, index=future_idx)
+        return pd.DataFrame({"yhat": mean, "lower": conf.iloc[:, 0], "upper": conf.iloc[:, 1]}, index=future_idx)
     except Exception:
         yhat = pd.Series(last, index=future_idx)
         steps = np.arange(1, horizon_days + 1)
         band = 1.65 * last * vol * np.sqrt(steps)
-        lower = yhat.values - band
-        upper = yhat.values + band
-        return pd.DataFrame({"yhat": yhat, "lower": lower, "upper": upper}, index=future_idx)
+        return pd.DataFrame({"yhat": yhat, "lower": yhat.values - band, "upper": yhat.values + band}, index=future_idx)
 
 def plot_forecast(hist_close: pd.Series, fc_df: pd.DataFrame, symbol: str, label_suffix: str = ""):
     if fc_df is None or fc_df.empty:
@@ -353,10 +327,7 @@ def plot_forecast(hist_close: pd.Series, fc_df: pd.DataFrame, symbol: str, label
 
 @st.cache_resource(show_spinner=False)
 def _load_sentiment_pipeline():
-    """
-    Lazy-load multilingual sentiment if transformers is available.
-    Returns a pipeline or None.
-    """
+    # Lazy-load multilingual sentiment if transformers is available. Returns pipeline or None.
     if not _TRANSFORMERS_OK:
         return None
     try:
@@ -368,15 +339,12 @@ def _load_sentiment_pipeline():
         return None
 
 def _score_headlines_sentiment(news_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns a DataFrame with columns: published_date (date), sent in [-1,1].
-    """
+    # Return DataFrame: published_date (date), sent in [-1,1]
     if news_df is None or news_df.empty:
         return pd.DataFrame(columns=["published_date", "sent"])
 
     pipe = _load_sentiment_pipeline()
     if pipe is None:
-        # Transformers not available; return zeros to keep pipeline flowing
         df = news_df.dropna(subset=["published"]).copy()
         df["published_date"] = pd.to_datetime(df["published"]).dt.date
         return df[["published_date"]].assign(sent=0.0).drop_duplicates()
@@ -399,9 +367,7 @@ def _score_headlines_sentiment(news_df: pd.DataFrame) -> pd.DataFrame:
     return daily.reset_index()
 
 def _build_daily_sentiment_series(news_df: pd.DataFrame, hist_index: pd.DatetimeIndex) -> pd.Series:
-    """
-    Align daily mean sentiment to the price index dates; forward-fill a few days (weekend news).
-    """
+    # Align daily mean sentiment to price index; ffill a few days (weekend news)
     if news_df is None or news_df.empty:
         return pd.Series(0.0, index=hist_index)
 
@@ -416,10 +382,7 @@ def _build_daily_sentiment_series(news_df: pd.DataFrame, hist_index: pd.Datetime
 def make_arimax_with_sentiment(close_series: pd.Series,
                                sentiment_series: pd.Series,
                                horizon_days: int):
-    """
-    Train SARIMAX (ARIMA) with exogenous daily sentiment.
-    Returns DataFrame with yhat, lower, upper indexed by future business days.
-    """
+    # Train SARIMAX (ARIMA) with exogenous daily sentiment and forecast
     if not _SARIMAX_OK:
         raise RuntimeError("statsmodels.sarimax not available. Install statsmodels >= 0.13.")
 
@@ -433,14 +396,12 @@ def make_arimax_with_sentiment(close_series: pd.Series,
     fit = model.fit(disp=False)
 
     future_idx = pd.bdate_range(s.index[-1] + pd.tseries.offsets.BDay(1), periods=horizon_days, freq="B")
-    future_exog = pd.Series(0.0, index=future_idx)  # neutral future news assumption
+    future_exog = pd.Series(0.0, index=future_idx)
 
     pred = fit.get_forecast(steps=horizon_days, exog=future_exog.values.reshape(-1, 1))
     mean = pred.predicted_mean
-    conf = pred.conf_int(alpha=0.10)  # ~90%
-    lower = conf.iloc[:, 0]
-    upper = conf.iloc[:, 1]
-    out = pd.DataFrame({"yhat": mean, "lower": lower, "upper": upper}, index=future_idx)
+    conf = pred.conf_int(alpha=0.10)
+    out = pd.DataFrame({"yhat": mean, "lower": conf.iloc[:, 0], "upper": conf.iloc[:, 1]}, index=future_idx)
     return out
 
 # =========================
@@ -457,10 +418,7 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.reindex(series.index)
 
 def _near_n_day_low(df: pd.DataFrame, n: int, tol_pct: float) -> tuple[bool, float, float]:
-    """
-    Return (is_near_low, n_low, dist_pct)
-    dist_pct = (close / n_low - 1)*100
-    """
+    # Return (is_near_low, n_low, dist_pct)
     if df.empty or "close" not in df.columns:
         return False, np.nan, np.nan
     closes = df["close"].astype(float)
@@ -472,9 +430,7 @@ def _near_n_day_low(df: pd.DataFrame, n: int, tol_pct: float) -> tuple[bool, flo
     return dist <= tol_pct, n_low, dist
 
 def _rebound_signal(df: pd.DataFrame) -> tuple[bool, dict]:
-    """
-    Simple rebound: Close > SMA20, SMA20 rising vs yesterday, RSI(14) rising (vs 3 days ago).
-    """
+    # Rebound: Close > SMA20, SMA20 rising, RSI(14) rising vs 3 days ago
     meta = {"close_gt_sma20": False, "sma20_rising": False, "rsi_rising": False, "rsi": np.nan}
     if df.empty or "close" not in df.columns:
         return False, meta
@@ -602,7 +558,6 @@ if news_err:
 if news_df.empty:
     st.info("No recent news found from common VN finance sources. Try broadening the query.")
 else:
-    # Pair headlines with nearest daily return
     daily_ret = hist["close"].pct_change().rename("ret") if "close" in hist.columns else pd.Series(dtype=float)
 
     def nearest_return(dt):
@@ -637,7 +592,6 @@ with st.expander("Use headlines sentiment as an exogenous feature"):
                                     help="Requires 'transformers' & 'torch' on first use (model download).")
 
     if run_news_forecast:
-        # Prepare series aligned to business days
         s_close2 = hist["close"].dropna().copy()
         s_close2.index = pd.to_datetime(s_close2.index)
         s_close2 = s_close2.asfreq("B").ffill()
@@ -647,7 +601,6 @@ with st.expander("Use headlines sentiment as an exogenous feature"):
         try:
             fc_news = make_arimax_with_sentiment(s_close2, sent_series, horizon_days=horizon_news)
             plot_forecast(s_close2, fc_news, resolved, label_suffix=" (news-aware)")
-            # Transparency: show recent sentiment
             with st.expander("Show recent daily sentiment used in the model"):
                 df_view = pd.DataFrame({
                     "date": s_close2.index,
@@ -665,7 +618,7 @@ with st.expander("Use headlines sentiment as an exogenous feature"):
                 st.error(f"Could not run news-aware forecast: {e}")
 
 # ============================================================
-# NEW FEATURE: Buy-the-dip candidates (N-day low + rebound)
+# Recommender: Buy-the-dip candidates (N-day low + rebound)
 # ============================================================
 
 st.subheader("🎯 Buy-the-dip candidates (N-day low + rebound)")
@@ -703,23 +656,16 @@ def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]
     df = get_all_symbols_df()
     if df.empty:
         return []
-    # Prefer symbols that look like listed tickers and appear active; take first N
     sym_col = "symbol" if "symbol" in df.columns else df.columns[0]
     syms = df[sym_col].astype(str).str.upper().tolist()
-    # Basic cleaning
     syms = [s for s in syms if re.fullmatch(r"[A-Z0-9]{2,6}", s)]
     return syms[:limit]
 
-def _date_str_days_ago(days: int) -> str:
-    return (datetime.utcnow().date() - timedelta(days=days)).isoformat()
-
 def _safe_load_hist_for_screener(ticker: str, days: int, source: str) -> pd.DataFrame:
-    # use utc date range
     end = datetime.utcnow().date().isoformat()
     start = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
     try:
-        df = load_history(ticker, start, end, source=source)
-        return df
+        return load_history(ticker, start, end, source=source)
     except Exception:
         return pd.DataFrame()
 
@@ -740,7 +686,6 @@ if run_scan:
             df = _safe_load_hist_for_screener(sym, int(history_days), source=source)
             if df.empty or df.shape[0] < max(lookback_n, 25):
                 continue
-            # Liquidity filter
             if _avg_volume(df, 20) < min_avg_vol:
                 continue
 
@@ -751,13 +696,13 @@ if run_scan:
             if not rebound_ok:
                 continue
 
-            last_close = float(df["close"].iloc[-1])
+            last_close_val = float(df["close"].iloc[-1])
             ret_5d = float(df["close"].pct_change(5).iloc[-1]) if df.shape[0] >= 6 else np.nan
             vol20 = _avg_volume(df, 20)
 
             rows.append({
                 "Ticker": sym,
-                f"Close": round(last_close, 2),
+                "Close": round(last_close_val, 2),
                 f"N({lookback_n}) Low": round(nlow, 2) if pd.notna(nlow) else np.nan,
                 "Dist to N-low (%)": round(dist, 2),
                 "SMA20 rising": meta["sma20_rising"],
@@ -773,16 +718,14 @@ if run_scan:
             st.info("No candidates found with the current filters. Try increasing the near-low threshold or lowering min volume.")
         else:
             res = pd.DataFrame(rows)
-            # Simple rank: closer to n-low (smaller dist), higher 5D return, higher volume
             res["rank_score"] = (-res["Dist to N-low (%)"].fillna(999)
                                  + res["5D Return (%)"].fillna(0)
-                                 + (res["Avg Vol(20d)"].fillna(0) / 100000))  # scale volume
+                                 + (res["Avg Vol(20d)"].fillna(0) / 100000))
             res = res.sort_values("rank_score", ascending=False).drop(columns=["rank_score"])
 
             st.success(f"Found {len(res)} candidates.")
             st.dataframe(res, use_container_width=True)
 
-            # Download
             csv = res.to_csv(index=False).encode("utf-8")
             st.download_button("Download results (CSV)", data=csv, file_name="vn_candidates_near_low.csv", mime="text/csv")
 
