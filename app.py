@@ -15,7 +15,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, UTC  # <-- added UTC
 from dateutil import parser as dtparser
 import time
 import re
@@ -708,8 +708,10 @@ def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]
     return FALLBACK_UNIVERSE[:limit] if limit else FALLBACK_UNIVERSE
 
 def _safe_load_hist_for_screener(ticker: str, days: int, source: str) -> pd.DataFrame:
-    end = datetime.utcnow().date().isoformat()
-    start = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+    # Use timezone-aware UTC to avoid deprecation of datetime.utcnow()
+    today_utc = datetime.now(UTC).date()
+    end = today_utc.isoformat()
+    start = (today_utc - timedelta(days=days)).isoformat()
     try:
         return load_history(ticker, start, end, source=source)
     except Exception:
