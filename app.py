@@ -9,20 +9,23 @@
 #    * Price-only: Holt-Winters, ARIMA(1,1,1), SMA, Naive
 #    * News-aware (optional): ARIMAX with headline sentiment as exogenous input
 # - Recommender: N-day-low + rebound screener
-# - Robust listings: retries, TTL cache, manual refresh, fallback universe
+# - Robust listings: retries, TTL cache, manual refresh, disk fallback universe
+# - UI debug logger (instead of print) to view diagnostics in the page
 # -----------------------------------------------------------
 
-import streamlit as st
+import os
+import re
+import time
+import feedparser
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date, timedelta, datetime, UTC  # <-- added UTC
+import streamlit as st
+
+from datetime import date, timedelta, datetime, UTC
 from dateutil import parser as dtparser
-import time
-import re
-import feedparser
 from urllib.parse import urlencode, quote_plus
 
-import numpy as np
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 
@@ -42,6 +45,15 @@ from vnstock import Vnstock
 st.set_page_config(page_title="Vietnam Stock + News + Forecast", layout="wide")
 
 # =========================
+# UI Logger (instead of print)
+# =========================
+def _log(msg: str):
+    """Append debug text to a session-scoped buffer for showing in the UI."""
+    buf = st.session_state.get("_debug_log", [])
+    buf.append(str(msg))
+    st.session_state["_debug_log"] = buf
+
+# =========================
 # Utilities & Caching
 # =========================
 
@@ -52,6 +64,30 @@ FALLBACK_UNIVERSE = [
     "VNM","MSN","SAB","HPG","FPT","MWG","GVR","GAS","PLX","POW","REE","VJC","HVN",
     "SSI","VND","TCI","SHS","VIX","HCM","VCI","FTS"
 ]
+
+# On-disk symbols cache (survives cold boots on Streamlit Cloud)
+SYMBOLS_CACHE_PATH = "symbols_cache.parquet"
+
+def _load_symbols_cache() -> pd.DataFrame:
+    try:
+        if os.path.exists(SYMBOLS_CACHE_PATH):
+            df = pd.read_parquet(SYMBOLS_CACHE_PATH)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                df.columns = [c.lower() for c in df.columns]
+                _log(f"[cache] Loaded symbols_cache.parquet with shape={df.shape}")
+                return df
+    except Exception as e:
+        _log(f"[cache] Failed to read symbols_cache.parquet: {e}")
+    return pd.DataFrame()
+
+def _save_symbols_cache(df: pd.DataFrame) -> None:
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df.to_parquet(SYMBOLS_CACHE_PATH, index=False)
+            _log(f"[cache] Saved symbols_cache.parquet with shape={df.shape}")
+    except Exception as e:
+        _log(f"[cache] Failed to save symbols_cache.parquet: {e}")
 
 _CONTROL_CHARS_REGEX = re.compile(r"[\x00-\x1f\x7f]")  # remove control chars that break URLs
 
@@ -74,35 +110,53 @@ def _sanitize_query_for_url(q: str) -> str:
     q = " ".join(q.split())
     return q
 
-# Important: TTL so it refreshes periodically; raise on empty so Streamlit won't cache empties
-@st.cache_data(show_spinner=False, ttl=3600)
+# TTL so it refreshes periodically; on failure use disk cache; raise if nothing
+@st.cache_data(show_spinner=False, ttl=3600, persist="disk")
 def get_all_symbols_df() -> pd.DataFrame:
-    # Pull all symbols for lookup via vnstock Listing(); retries + diagnostics
+    """
+    Try live vnstock Listing() (with retries). On failure, use a disk cache if available.
+    If both fail, raise so caller can fall back to VN30 universe.
+    """
     try:
         from vnstock import Listing
         listing = Listing()
         last_exc = None
-        for _ in range(3):
+        for attempt in range(1, 4):
             try:
-                print("==============================-list all symbols-==============================")
+                _log(f"[listing] Attempt {attempt} → Listing().all_symbols()")
                 df = listing.all_symbols()
-                print(df)
-                print("==============================-end list all symbols-==============================")
+                _log(f"[listing] Raw shape: {getattr(df, 'shape', None)}")
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     df = df.copy()
                     df.columns = [c.lower() for c in df.columns]
                     st.session_state["symbols_error"] = None
+                    _save_symbols_cache(df)  # Persist for offline/rate-limited runs
                     return df
                 time.sleep(0.5)
             except Exception as e:
                 last_exc = e
+                _log(f"[listing] Attempt {attempt} failed: {type(e).__name__}: {e}")
                 time.sleep(0.7)
+
         msg = f"Empty/failed listing response. Last error: {type(last_exc).__name__}: {last_exc}" if last_exc else "Empty listing response."
         st.session_state["symbols_error"] = msg
-        raise RuntimeError(msg)  # do not cache empty
+        _log(f"[listing] Live fetch failed. {msg}")
+
+        # Disk cache fallback
+        cache_df = _load_symbols_cache()
+        if not cache_df.empty:
+            st.session_state["symbols_error"] = f"{msg} · Using cached symbols on disk."
+            return cache_df
+
+        raise RuntimeError(msg)  # nothing to return
     except Exception as e:
         st.session_state["symbols_error"] = f"{type(e).__name__}: {e}"
-        raise  # do not cache failures
+        _log(f"[listing] Unexpected error: {e}")
+        cache_df = _load_symbols_cache()
+        if not cache_df.empty:
+            st.session_state["symbols_error"] += " · Using cached symbols on disk."
+            return cache_df
+        raise
 
 @st.cache_data(show_spinner=False)
 def resolve_symbol(user_text: str) -> str | None:
@@ -150,6 +204,10 @@ def resolve_symbol(user_text: str) -> str | None:
 
     return None
 
+@st.cache_resource(show_spinner=False, ttl=3600)
+def get_vnstock():
+    return Vnstock()
+
 @st.cache_data(show_spinner=False)
 def load_history(
     ticker: str,
@@ -160,7 +218,7 @@ def load_history(
     backoff_sec: float = 0.8,
 ) -> pd.DataFrame:
     # Fetch OHLCV for [start, end] with fallback sources
-    vn = Vnstock()
+    vn = get_vnstock()
     sources = [source] if source not in (None, "", "Auto") else ["VCI", "TCBS", "SSI"]
     last_err = None
     attempts_log = []
@@ -658,10 +716,17 @@ with st.expander("Scan settings"):
         if st.button("↻ Refresh symbols"):
             st.cache_data.clear()   # clear cached listing & other data
             st.rerun()
+
     # Optional diagnostics
     err = st.session_state.get("symbols_error")
     if err:
         st.caption(f"Listing diagnostics: {err}")
+
+    # Show UI debug logs
+    logs = st.session_state.get("_debug_log", [])
+    if logs:
+        with st.expander("Debug logs"):
+            st.text("\n".join(logs[-400:]))
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -708,7 +773,7 @@ def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]
     return FALLBACK_UNIVERSE[:limit] if limit else FALLBACK_UNIVERSE
 
 def _safe_load_hist_for_screener(ticker: str, days: int, source: str) -> pd.DataFrame:
-    # Use timezone-aware UTC to avoid deprecation of datetime.utcnow()
+    # Use timezone-aware UTC (no utcnow deprecation)
     today_utc = datetime.now(UTC).date()
     end = today_utc.isoformat()
     start = (today_utc - timedelta(days=days)).isoformat()
