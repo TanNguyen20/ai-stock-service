@@ -87,15 +87,15 @@ def get_all_symbols_df() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def resolve_symbol(user_text: str) -> str | None:
     """
-    Accepts: 'HPG', 'Hòa Phát', 'MSR', 'Masan', ...
+    Accepts: 'HPG', 'Hòa Phát', 'MSR', 'Masan', 'TV2', ...
     Returns: ticker code if found else None
     """
     s = (user_text or "").strip()
     if not s:
         return None
 
-    # If user typed a likely ticker already
-    if re.fullmatch(r"[A-Za-z]{2,5}", s):
+    # If user typed a likely ticker already (letters or digits, 2–6)
+    if re.fullmatch(r"[A-Za-z0-9]{2,6}", s):   # <-- CHANGED
         return s.upper()
 
     df = get_all_symbols_df()
@@ -458,7 +458,7 @@ with colA:
     user_input = st.text_input(
         "Enter ticker or company name (e.g., HPG / Hòa Phát, MSR / Masan High-Tech Materials):",
         value="HPG",
-        placeholder="HPG or Hòa Phát"
+        placeholder="HPG, TV2, or Hòa Phát"
     )
 with colB:
     source = st.selectbox(
@@ -470,10 +470,10 @@ with colB:
 
 # Resolve to ticker
 resolved = resolve_symbol(user_input) or (
-    user_input.strip().upper() if re.fullmatch(r"[A-Za-z]{2,5}", user_input.strip()) else None
+    user_input.strip().upper() if re.fullmatch(r"[A-Za-z0-9]{2,6}", user_input.strip()) else None  # <-- CHANGED
 )
 if not resolved:
-    st.warning("⚠️ Could not detect a valid ticker. Try the exact code (HPG, MSN, VNM) or a different company name.")
+    st.warning("⚠️ Could not detect a valid ticker. Try the exact code (HPG, TV2, MSN, VNM) or a different company name.")
     st.stop()
 
 # Dates
