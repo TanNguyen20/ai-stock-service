@@ -84,7 +84,10 @@ def get_all_symbols_df() -> pd.DataFrame:
         last_exc = None
         for _ in range(3):
             try:
+                print("==============================-list all symbols-==============================")
                 df = listing.all_symbols()
+                print(df)
+                print("==============================-end list all symbols-==============================")
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     df = df.copy()
                     df.columns = [c.lower() for c in df.columns]
