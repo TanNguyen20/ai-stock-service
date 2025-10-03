@@ -9,6 +9,7 @@
 #    * Price-only: Holt-Winters, ARIMA(1,1,1), SMA, Naive
 #    * News-aware (optional): ARIMAX with headline sentiment as exogenous input
 # - Recommender: N-day-low + rebound screener
+# - Robust listings: retries, TTL cache, manual refresh, fallback universe
 # -----------------------------------------------------------
 
 import streamlit as st
@@ -44,6 +45,14 @@ st.set_page_config(page_title="Vietnam Stock + News + Forecast", layout="wide")
 # Utilities & Caching
 # =========================
 
+# Fallback universe (VN30 / liquid HOSE names; tweak as you like)
+FALLBACK_UNIVERSE = [
+    "VCB","BID","CTG","TCB","VPB","MBB","STB","HDB","VIB","ACB","SHB",
+    "VIC","VHM","VRE","NVL","PDR","KDH",
+    "VNM","MSN","SAB","HPG","FPT","MWG","GVR","GAS","PLX","POW","REE","VJC","HVN",
+    "SSI","VND","TCI","SHS","VIX","HCM","VCI","FTS"
+]
+
 _CONTROL_CHARS_REGEX = re.compile(r"[\x00-\x1f\x7f]")  # remove control chars that break URLs
 
 def _strip_accents(text: str) -> str:
@@ -65,20 +74,32 @@ def _sanitize_query_for_url(q: str) -> str:
     q = " ".join(q.split())
     return q
 
-@st.cache_data(show_spinner=False)
+# Important: TTL so it refreshes periodically; raise on empty so Streamlit won't cache empties
+@st.cache_data(show_spinner=False, ttl=3600)
 def get_all_symbols_df() -> pd.DataFrame:
-    # Pull all symbols for lookup via vnstock Listing()
+    # Pull all symbols for lookup via vnstock Listing(); retries + diagnostics
     try:
         from vnstock import Listing
         listing = Listing()
-        df = listing.all_symbols()
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df = df.copy()
-            df.columns = [c.lower() for c in df.columns]
-            return df
-    except Exception:
-        pass
-    return pd.DataFrame()
+        last_exc = None
+        for _ in range(3):
+            try:
+                df = listing.all_symbols()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    df = df.copy()
+                    df.columns = [c.lower() for c in df.columns]
+                    st.session_state["symbols_error"] = None
+                    return df
+                time.sleep(0.5)
+            except Exception as e:
+                last_exc = e
+                time.sleep(0.7)
+        msg = f"Empty/failed listing response. Last error: {type(last_exc).__name__}: {last_exc}" if last_exc else "Empty listing response."
+        st.session_state["symbols_error"] = msg
+        raise RuntimeError(msg)  # do not cache empty
+    except Exception as e:
+        st.session_state["symbols_error"] = f"{type(e).__name__}: {e}"
+        raise  # do not cache failures
 
 @st.cache_data(show_spinner=False)
 def resolve_symbol(user_text: str) -> str | None:
@@ -91,7 +112,12 @@ def resolve_symbol(user_text: str) -> str | None:
     if re.fullmatch(r"[A-Za-z0-9]{2,6}", s):
         return s.upper()
 
-    df = get_all_symbols_df()
+    # Try listing-based fuzzy match but survive listing failures
+    try:
+        df = get_all_symbols_df()
+    except Exception:
+        df = pd.DataFrame()
+
     if df.empty:
         return None
 
@@ -624,6 +650,16 @@ with st.expander("Use headlines sentiment as an exogenous feature"):
 st.subheader("🎯 Buy-the-dip candidates (N-day low + rebound)")
 
 with st.expander("Scan settings"):
+    colr1, colr2 = st.columns([1,3])
+    with colr1:
+        if st.button("↻ Refresh symbols"):
+            st.cache_data.clear()   # clear cached listing & other data
+            st.experimental_rerun()
+    # Optional diagnostics
+    err = st.session_state.get("symbols_error")
+    if err:
+        st.caption(f"Listing diagnostics: {err}")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         lookback_n = st.number_input("Lookback N (days)", min_value=20, max_value=250, value=60, step=5)
@@ -653,13 +689,20 @@ def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]
     if universe_mode == "Custom list":
         arr = _parse_custom_list(custom_text)
         return arr[:limit] if limit else arr
-    df = get_all_symbols_df()
-    if df.empty:
-        return []
-    sym_col = "symbol" if "symbol" in df.columns else df.columns[0]
-    syms = df[sym_col].astype(str).str.upper().tolist()
-    syms = [s for s in syms if re.fullmatch(r"[A-Z0-9]{2,6}", s)]
-    return syms[:limit]
+
+    # Try live listings; on failure/empty, we fall back
+    try:
+        df = get_all_symbols_df()
+        sym_col = "symbol" if "symbol" in df.columns else df.columns[0]
+        syms = df[sym_col].astype(str).str.upper().tolist()
+        syms = [s for s in syms if re.fullmatch(r"[A-Z0-9]{2,6}", s)]
+        if syms:
+            return syms[:limit]
+    except Exception:
+        pass
+
+    # Fallback universe
+    return FALLBACK_UNIVERSE[:limit] if limit else FALLBACK_UNIVERSE
 
 def _safe_load_hist_for_screener(ticker: str, days: int, source: str) -> pd.DataFrame:
     end = datetime.utcnow().date().isoformat()
@@ -677,8 +720,20 @@ def _avg_volume(df: pd.DataFrame, window: int = 20) -> float:
 if run_scan:
     universe = _get_universe(universe_mode, custom_list, int(max_symbols))
     if not universe:
-        st.warning("No symbols to scan. Adjust universe or provide a custom list.")
+        st.warning("No symbols to scan. Try a custom list (e.g., HPG, VNM, FPT).")
+        err = st.session_state.get("symbols_error")
+        if err:
+            st.caption(f"Listing diagnostics: {err}")
     else:
+        # Note when fallback was used
+        used_fallback = False
+        try:
+            _ = get_all_symbols_df()  # will raise if listing failed (meaning fallback used)
+        except Exception:
+            used_fallback = True
+        if universe_mode == "All symbols (auto)" and used_fallback:
+            st.caption("Using fallback universe (VN30/liquid HOSE) because listings were unavailable.")
+
         rows = []
         progress = st.progress(0.0, text="Scanning…")
         for i, sym in enumerate(universe, start=1):
