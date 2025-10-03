@@ -8,12 +8,13 @@
 # - Forecasts:
 #    * Price-only: Holt-Winters, ARIMA(1,1,1), SMA, Naive
 #    * News-aware (optional): ARIMAX (SARIMAX) with headline sentiment as exogenous input
+# - NEW: Recommender — tickers near N-day low with rebound signals
 # -----------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from dateutil import parser as dtparser
 import time
 import re
@@ -41,7 +42,6 @@ except Exception:
 from vnstock import Vnstock
 
 st.set_page_config(page_title="Vietnam Stock + News + Forecast", layout="wide")
-
 
 # =========================
 # Utilities & Caching
@@ -94,8 +94,8 @@ def resolve_symbol(user_text: str) -> str | None:
     if not s:
         return None
 
-    # If user typed a likely ticker already (letters or digits, 2–6)
-    if re.fullmatch(r"[A-Za-z0-9]{2,6}", s):   # <-- CHANGED
+    # Allow letters or digits, 2–6 chars (so TV2 works)
+    if re.fullmatch(r"[A-Za-z0-9]{2,6}", s):
         return s.upper()
 
     df = get_all_symbols_df()
@@ -203,7 +203,6 @@ def plot_candles(df: pd.DataFrame, symbol: str, ma_fast=20, ma_slow=50):
                       xaxis_title=None, yaxis_title="Price", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-
 # =========================
 # News via Google News RSS
 # =========================
@@ -254,7 +253,6 @@ def fetch_news_headlines(query_text: str, limit: int = 20):
         return df, None
     except Exception as e:
         return pd.DataFrame(), f"{type(e).__name__}: {e}"
-
 
 # =========================
 # Price-only Forecast Helpers
@@ -348,7 +346,6 @@ def plot_forecast(hist_close: pd.Series, fc_df: pd.DataFrame, symbol: str, label
     fig.update_layout(height=420, margin=dict(l=0, r=0, t=30, b=0),
                       xaxis_title=None, yaxis_title="Price", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
-
 
 # =========================
 # Sentiment / News-aware Forecast
@@ -446,6 +443,60 @@ def make_arimax_with_sentiment(close_series: pd.Series,
     out = pd.DataFrame({"yhat": mean, "lower": lower, "upper": upper}, index=future_idx)
     return out
 
+# =========================
+# Simple indicators for screener
+# =========================
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    s = series.dropna().astype(float)
+    delta = s.diff()
+    up = (delta.clip(lower=0)).rolling(period).mean()
+    down = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = up / (down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.reindex(series.index)
+
+def _near_n_day_low(df: pd.DataFrame, n: int, tol_pct: float) -> tuple[bool, float, float]:
+    """
+    Return (is_near_low, n_low, dist_pct)
+    dist_pct = (close / n_low - 1)*100
+    """
+    if df.empty or "close" not in df.columns:
+        return False, np.nan, np.nan
+    closes = df["close"].astype(float)
+    if closes.shape[0] < n:
+        return False, np.nan, np.nan
+    n_low = closes.tail(n).min()
+    last = closes.iloc[-1]
+    dist = (last / n_low - 1.0) * 100.0
+    return dist <= tol_pct, n_low, dist
+
+def _rebound_signal(df: pd.DataFrame) -> tuple[bool, dict]:
+    """
+    Simple rebound: Close > SMA20, SMA20 rising vs yesterday, RSI(14) rising (vs 3 days ago).
+    """
+    meta = {"close_gt_sma20": False, "sma20_rising": False, "rsi_rising": False, "rsi": np.nan}
+    if df.empty or "close" not in df.columns:
+        return False, meta
+    s = df["close"].astype(float)
+    sma20 = s.rolling(20).mean()
+    rsi = _rsi(s, 14)
+    if s.shape[0] < 25:
+        meta["rsi"] = float(rsi.iloc[-1]) if not rsi.dropna().empty else np.nan
+        return False, meta
+    close_gt_sma20 = bool(s.iloc[-1] > sma20.iloc[-1])
+    sma20_rising = bool(sma20.iloc[-1] > sma20.iloc[-2])
+    rsi_rising = False
+    if rsi.dropna().shape[0] >= 4:
+        rsi_rising = bool(rsi.iloc[-1] > rsi.iloc[-4])
+    meta.update({
+        "close_gt_sma20": close_gt_sma20,
+        "sma20_rising": sma20_rising,
+        "rsi_rising": rsi_rising,
+        "rsi": float(rsi.iloc[-1]) if not rsi.dropna().empty else np.nan
+    })
+    ok = close_gt_sma20 and sma20_rising and rsi_rising
+    return ok, meta
 
 # =========================
 # UI
@@ -470,7 +521,7 @@ with colB:
 
 # Resolve to ticker
 resolved = resolve_symbol(user_input) or (
-    user_input.strip().upper() if re.fullmatch(r"[A-Za-z0-9]{2,6}", user_input.strip()) else None  # <-- CHANGED
+    user_input.strip().upper() if re.fullmatch(r"[A-Za-z0-9]{2,6}", user_input.strip()) else None
 )
 if not resolved:
     st.warning("⚠️ Could not detect a valid ticker. Try the exact code (HPG, TV2, MSN, VNM) or a different company name.")
@@ -613,4 +664,126 @@ with st.expander("Use headlines sentiment as an exogenous feature"):
             else:
                 st.error(f"Could not run news-aware forecast: {e}")
 
-st.caption("Disclaimer: Data is for research/education only. Not investment advice. Prices via vnstock; headlines via Google News RSS.")
+# ============================================================
+# NEW FEATURE: Buy-the-dip candidates (N-day low + rebound)
+# ============================================================
+
+st.subheader("🎯 Buy-the-dip candidates (N-day low + rebound)")
+
+with st.expander("Scan settings"):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        lookback_n = st.number_input("Lookback N (days)", min_value=20, max_value=250, value=60, step=5)
+        near_low_pct = st.number_input("Near-low threshold (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.1)
+    with col2:
+        history_days = st.number_input("History window (days)", min_value=int(lookback_n), max_value=800, value=max(180, int(lookback_n)+20), step=10)
+        min_avg_vol = st.number_input("Min avg volume (last 20d)", min_value=0, max_value=10_000_000, value=50_000, step=10_000)
+    with col3:
+        universe_mode = st.selectbox("Universe", ["All symbols (auto)", "Custom list"])
+        max_symbols = st.number_input("Max symbols to scan", min_value=10, max_value=500, value=120, step=10)
+
+    custom_list = ""
+    if universe_mode == "Custom list":
+        custom_list = st.text_area("Tickers (comma / space separated, e.g., HPG, VNM, TV2)", value="HPG, VNM, TV2, FPT")
+
+    run_scan = st.button("Run scan")
+
+def _parse_custom_list(text: str) -> list[str]:
+    if not text:
+        return []
+    ticks = re.split(r"[,\s]+", text.strip().upper())
+    ticks = [t for t in ticks if re.fullmatch(r"[A-Z0-9]{2,6}", t)]
+    return list(dict.fromkeys(ticks))  # unique, keep order
+
+@st.cache_data(show_spinner=False)
+def _get_universe(universe_mode: str, custom_text: str, limit: int) -> list[str]:
+    if universe_mode == "Custom list":
+        arr = _parse_custom_list(custom_text)
+        return arr[:limit] if limit else arr
+    df = get_all_symbols_df()
+    if df.empty:
+        return []
+    # Prefer symbols that look like listed tickers and appear active; take first N
+    sym_col = "symbol" if "symbol" in df.columns else df.columns[0]
+    syms = df[sym_col].astype(str).str.upper().tolist()
+    # Basic cleaning
+    syms = [s for s in syms if re.fullmatch(r"[A-Z0-9]{2,6}", s)]
+    return syms[:limit]
+
+def _date_str_days_ago(days: int) -> str:
+    return (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+
+def _safe_load_hist_for_screener(ticker: str, days: int, source: str) -> pd.DataFrame:
+    # use utc date range
+    end = datetime.utcnow().date().isoformat()
+    start = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+    try:
+        df = load_history(ticker, start, end, source=source)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _avg_volume(df: pd.DataFrame, window: int = 20) -> float:
+    if df.empty or "volume" not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df["volume"], errors="coerce").tail(window).mean())
+
+if run_scan:
+    universe = _get_universe(universe_mode, custom_list, int(max_symbols))
+    if not universe:
+        st.warning("No symbols to scan. Adjust universe or provide a custom list.")
+    else:
+        rows = []
+        progress = st.progress(0.0, text="Scanning…")
+        for i, sym in enumerate(universe, start=1):
+            progress.progress(i/len(universe), text=f"Scanning {sym} ({i}/{len(universe)})")
+            df = _safe_load_hist_for_screener(sym, int(history_days), source=source)
+            if df.empty or df.shape[0] < max(lookback_n, 25):
+                continue
+            # Liquidity filter
+            if _avg_volume(df, 20) < min_avg_vol:
+                continue
+
+            is_near, nlow, dist = _near_n_day_low(df, int(lookback_n), float(near_low_pct))
+            if not is_near:
+                continue
+            rebound_ok, meta = _rebound_signal(df)
+            if not rebound_ok:
+                continue
+
+            last_close = float(df["close"].iloc[-1])
+            ret_5d = float(df["close"].pct_change(5).iloc[-1]) if df.shape[0] >= 6 else np.nan
+            vol20 = _avg_volume(df, 20)
+
+            rows.append({
+                "Ticker": sym,
+                f"Close": round(last_close, 2),
+                f"N({lookback_n}) Low": round(nlow, 2) if pd.notna(nlow) else np.nan,
+                "Dist to N-low (%)": round(dist, 2),
+                "SMA20 rising": meta["sma20_rising"],
+                "RSI(14)": round(meta["rsi"], 1) if pd.notna(meta["rsi"]) else np.nan,
+                "Close>SMA20": meta["close_gt_sma20"],
+                "5D Return (%)": round(ret_5d*100, 2) if pd.notna(ret_5d) else np.nan,
+                "Avg Vol(20d)": int(vol20),
+            })
+
+        progress.empty()
+
+        if not rows:
+            st.info("No candidates found with the current filters. Try increasing the near-low threshold or lowering min volume.")
+        else:
+            res = pd.DataFrame(rows)
+            # Simple rank: closer to n-low (smaller dist), higher 5D return, higher volume
+            res["rank_score"] = (-res["Dist to N-low (%)"].fillna(999)
+                                 + res["5D Return (%)"].fillna(0)
+                                 + (res["Avg Vol(20d)"].fillna(0) / 100000))  # scale volume
+            res = res.sort_values("rank_score", ascending=False).drop(columns=["rank_score"])
+
+            st.success(f"Found {len(res)} candidates.")
+            st.dataframe(res, use_container_width=True)
+
+            # Download
+            csv = res.to_csv(index=False).encode("utf-8")
+            st.download_button("Download results (CSV)", data=csv, file_name="vn_candidates_near_low.csv", mime="text/csv")
+
+st.caption("Disclaimer: Educational tool only. Not investment advice. Prices via vnstock; headlines via Google News RSS.")
